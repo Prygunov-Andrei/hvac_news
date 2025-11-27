@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     # Local apps
     'users',
     'references',
+    'news',
 ]
 
 MIDDLEWARE = [
@@ -147,6 +148,15 @@ LANGUAGES = [
 ]
 
 MODELTRANSLATION_DEFAULT_LANGUAGE = 'ru'
+# По умолчанию для всех языков искать в ru, потом en
+# Можно настроить более тонко для каждого языка, если потребуется (через MODELTRANSLATION_FALLBACK_LANGUAGES словарь)
+MODELTRANSLATION_FALLBACK_LANGUAGES = {
+    'default': ('ru', 'en'),
+    'ru': ('en',),
+    'en': ('ru',),
+    'de': ('en', 'ru'),
+    'pt': ('en', 'ru'),
+}
 
 
 # Static files (CSS, JavaScript, Images)
@@ -155,7 +165,7 @@ MODELTRANSLATION_DEFAULT_LANGUAGE = 'ru'
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
-MEDIA_URL = 'media/'
+MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 # Default primary key field type
@@ -207,6 +217,7 @@ SIMPLE_JWT = {
 
 # CORS Configuration
 CORS_ALLOW_ALL_ORIGINS = True  # For development only
+CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
     'accept',
     'accept-encoding',
@@ -218,4 +229,11 @@ CORS_ALLOW_HEADERS = [
     'x-csrftoken',
     'x-requested-with',
     'ngrok-skip-browser-warning',
+]
+
+# CSRF Configuration for ngrok
+CSRF_TRUSTED_ORIGINS = [
+    'https://f6c058cfd2ea.ngrok-free.app',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
 ]
