@@ -15,4 +15,7 @@ urlpatterns = [
     path('api/auth/users/', include('users.urls')),
     path('api/auth/jwt/create/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/auth/jwt/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+
+    # References
+    path('api/references/', include('references.urls')),
 ]

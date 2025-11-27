@@ -46,6 +46,7 @@ INSTALLED_APPS = [
 
     # Local apps
     'users',
+    'references',
 ]
 
 MIDDLEWARE = [
@@ -206,3 +207,15 @@ SIMPLE_JWT = {
 
 # CORS Configuration
 CORS_ALLOW_ALL_ORIGINS = True  # For development only
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+    'ngrok-skip-browser-warning',
+]
