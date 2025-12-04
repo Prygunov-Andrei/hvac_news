@@ -25,7 +25,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-default-key-for-dev')
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,*.ngrok.io,*.ngrok-free.app,hvac-news.ngrok.io').split(',')
 
 
 # Application definition
@@ -239,6 +239,10 @@ CSRF_TRUSTED_ORIGINS = [
     'http://127.0.0.1:8000',
     'https://*.loca.lt',
     'https://*.ngrok-free.app',
+    'https://*.ngrok.io',
+    'https://hvac-news.ngrok.io',
+    'https://*.trycloudflare.com',
+    'https://hvac-news.trycloudflare.com',
 ]
 
 # Email Configuration
