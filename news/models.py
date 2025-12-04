@@ -36,3 +36,26 @@ class NewsMedia(models.Model):
 
     def __str__(self):
         return f"{self.media_type}: {self.original_name}"
+
+
+class Comment(models.Model):
+    """
+    Модель комментария к новости.
+    Пользователи могут создавать, редактировать и удалять свои комментарии.
+    """
+    news_post = models.ForeignKey(NewsPost, on_delete=models.CASCADE, related_name='comments', verbose_name=_("News Post"))
+    author = models.ForeignKey(User, on_delete=models.CASCADE, related_name='comments', verbose_name=_("Author"))
+    text = models.TextField(_("Text"), max_length=2000)
+    created_at = models.DateTimeField(_("Created At"), auto_now_add=True)
+    updated_at = models.DateTimeField(_("Updated At"), auto_now=True)
+    
+    class Meta:
+        verbose_name = _("Comment")
+        verbose_name_plural = _("Comments")
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['news_post', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"Comment by {self.author.email} on {self.news_post.title[:50]}"

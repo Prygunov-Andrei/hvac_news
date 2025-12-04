@@ -4,7 +4,7 @@ from django.urls import path
 from django.utils.html import format_html
 from django import forms
 from modeltranslation.admin import TranslationAdmin
-from .models import NewsPost, NewsMedia
+from .models import NewsPost, NewsMedia, Comment
 from .services import NewsImportService
 
 class ImportNewsForm(forms.Form):
@@ -64,3 +64,15 @@ class NewsPostAdmin(TranslationAdmin):
 @admin.register(NewsMedia)
 class NewsMediaAdmin(admin.ModelAdmin):
     list_display = ('original_name', 'media_type', 'news_post')
+
+
+@admin.register(Comment)
+class CommentAdmin(admin.ModelAdmin):
+    list_display = ('author', 'news_post', 'text_preview', 'created_at')
+    list_filter = ('created_at', 'news_post')
+    search_fields = ('text', 'author__email', 'news_post__title')
+    readonly_fields = ('created_at', 'updated_at')
+    
+    def text_preview(self, obj):
+        return obj.text[:100] + '...' if len(obj.text) > 100 else obj.text
+    text_preview.short_description = 'Text Preview'

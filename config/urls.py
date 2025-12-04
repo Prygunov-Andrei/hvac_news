@@ -23,6 +23,9 @@ urlpatterns = [
 
     # News
     path('api/', include('news.urls')),
+    
+    # Feedback
+    path('api/', include('feedback.urls')),
 ]
 
 if settings.DEBUG:

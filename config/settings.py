@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     'users',
     'references',
     'news',
+    'feedback',
 ]
 
 MIDDLEWARE = [
@@ -229,11 +230,28 @@ CORS_ALLOW_HEADERS = [
     'x-csrftoken',
     'x-requested-with',
     'ngrok-skip-browser-warning',
+    'bypass-tunnel-reminder',
 ]
 
-# CSRF Configuration for ngrok
+# CSRF Configuration
 CSRF_TRUSTED_ORIGINS = [
-    'https://f6c058cfd2ea.ngrok-free.app',
     'http://localhost:8000',
     'http://127.0.0.1:8000',
+    'https://*.loca.lt',
+    'https://*.ngrok-free.app',
 ]
+
+# Email Configuration
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'noreply@hvacnews.com')
+ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'admin@hvacnews.com')
+
+# CAPTCHA Configuration
+CAPTCHA_TYPE = os.getenv('CAPTCHA_TYPE', 'hcaptcha')  # 'hcaptcha' or 'recaptcha'
+HCAPTCHA_SECRET_KEY = os.getenv('HCAPTCHA_SECRET_KEY', '')
+RECAPTCHA_SECRET_KEY = os.getenv('RECAPTCHA_SECRET_KEY', '')
