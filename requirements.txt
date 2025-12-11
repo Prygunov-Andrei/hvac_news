@@ -7,3 +7,4 @@ Pillow>=10.0
 django-cors-headers>=4.3
 django-modeltranslation>=0.18
 requests>=2.31
+openai>=1.0

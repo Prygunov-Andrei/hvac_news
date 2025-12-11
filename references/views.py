@@ -8,7 +8,7 @@ class ManufacturerViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.AllowAny] # Доступно всем для чтения
 
 class BrandViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Brand.objects.all()
+    queryset = Brand.objects.select_related('manufacturer').all()
     serializer_class = BrandSerializer
     permission_classes = [permissions.AllowAny]
 

@@ -1,3 +1,4 @@
+import logging
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -8,6 +9,8 @@ from django.utils.translation import gettext_lazy as _
 from .models import Feedback
 from .serializers import FeedbackSerializer
 from .captcha_utils import verify_captcha
+
+logger = logging.getLogger(__name__)
 
 
 @api_view(['POST'])
@@ -69,8 +72,7 @@ def create_feedback(request):
         )
     except Exception as e:
         # Логируем ошибку, но не прерываем процесс
-        # В продакшене лучше использовать logging
-        print(f"Error sending feedback email: {e}")
+        logger.error(f"Error sending feedback email: {e}", exc_info=True)
     
     return Response(
         {

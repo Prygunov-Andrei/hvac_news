@@ -87,27 +87,19 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases
 
-DB_ENGINE = os.getenv('DB_ENGINE', 'django.db.backends.sqlite3')
-DB_NAME = os.getenv('DB_NAME', BASE_DIR / 'db.sqlite3')
+DB_ENGINE = os.getenv('DB_ENGINE', 'django.db.backends.postgresql')
+DB_NAME = os.getenv('DB_NAME', 'hvac_db')
 
-if DB_ENGINE == 'django.db.backends.postgresql':
-    DATABASES = {
-        'default': {
-            'ENGINE': DB_ENGINE,
-            'NAME': DB_NAME,
-            'USER': os.getenv('DB_USER', 'postgres'),
-            'PASSWORD': os.getenv('DB_PASSWORD', 'postgres'),
-            'HOST': os.getenv('DB_HOST', 'localhost'),
-            'PORT': os.getenv('DB_PORT', '5432'),
-        }
+DATABASES = {
+    'default': {
+        'ENGINE': DB_ENGINE,
+        'NAME': DB_NAME,
+        'USER': os.getenv('DB_USER', 'postgres'),
+        'PASSWORD': os.getenv('DB_PASSWORD', 'postgres'),
+        'HOST': os.getenv('DB_HOST', 'localhost'),
+        'PORT': os.getenv('DB_PORT', '5432'),
     }
-else:
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
-        }
-    }
+}
 
 
 # Password validation
@@ -259,3 +251,9 @@ ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'admin@hvacnews.com')
 CAPTCHA_TYPE = os.getenv('CAPTCHA_TYPE', 'hcaptcha')  # 'hcaptcha' or 'recaptcha'
 HCAPTCHA_SECRET_KEY = os.getenv('HCAPTCHA_SECRET_KEY', '')
 RECAPTCHA_SECRET_KEY = os.getenv('RECAPTCHA_SECRET_KEY', '')
+
+# Translation Configuration
+TRANSLATION_PROVIDER = os.getenv('TRANSLATION_PROVIDER', 'openai')  # 'openai', 'anthropic', 'deepl'
+TRANSLATION_API_KEY = os.getenv('TRANSLATION_API_KEY', '')
+TRANSLATION_MODEL = os.getenv('TRANSLATION_MODEL', 'gpt-4o-mini')  # OpenAI model
+TRANSLATION_ENABLED = os.getenv('TRANSLATION_ENABLED', 'True') == 'True'
