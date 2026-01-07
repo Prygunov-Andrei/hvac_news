@@ -17,77 +17,80 @@ class Command(BaseCommand):
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.readlines()
 
-        count_resources = 0
+        count_created = 0
+        count_updated = 0
+        current_region = ''
 
         for line in content:
             line = line.strip()
             
-            # Skip empty lines, headers, separators
-            if not line or not line.startswith('|') or line.startswith('| :') or line.startswith('| --') or line.startswith('|--'):
+            # Skip empty lines
+            if not line:
                 continue
-
-            # Split by pipe |
-            raw_cells = line.split('|')
             
-            # Remove first and last elements if they are empty
-            if raw_cells and raw_cells[0].strip() == '':
-                raw_cells.pop(0)
-            if raw_cells and raw_cells[-1].strip() == '':
-                raw_cells.pop(-1)
-            
-            cells = [c.strip() for c in raw_cells]
-            
-            # Skip header row (contains "Resource Name")
-            if not cells or "Resource Name" in cells[0] or "---" in cells[0]:
+            # Track region headers (starting with ###)
+            if line.startswith('###'):
+                # Extract region name (remove ### and emoji if present)
+                current_region = re.sub(r'^###\s*[^\s]+\s*', '', line).strip()
                 continue
-
-            # Expected format: | Resource Name | News / Feed URL | Type | Short Description |
-            if len(cells) < 4:
-                continue
-
-            raw_name = cells[0].replace('**', '')
-            url_str = cells[1].replace('`', '')
-            resource_type = cells[2]
-            description = cells[3]
-
-            # Clean name (remove brackets if any, though in this file usually simple names or with country code)
-            name = raw_name.strip()
             
-            # Clean URL (sometimes multiple, take first)
-            url = url_str.split(' ')[0] if url_str else ''
-            if not url.startswith('http'):
-                url = ''
-
-            # Determine language
-            is_russian = bool(re.search('[а-яА-Я]', description))
-
-            # Format description to include Type
-            full_description = f"[{resource_type}] {description}"
-
-            defaults = {
-                'url': url,
-            }
-
-            if is_russian:
-                defaults['description_ru'] = full_description
-                defaults['description'] = full_description
-            else:
-                defaults['description_en'] = full_description
-                defaults['description'] = full_description
-
+            # Skip other markdown headers
+            if line.startswith('#'):
+                continue
+            
+            # Expected format: "Название" // "ссылка" // "Описание"
+            if ' // ' not in line:
+                continue
+            
+            # Split by " // "
+            parts = [part.strip() for part in line.split(' // ')]
+            
+            # Need at least name and URL
+            if len(parts) < 2:
+                continue
+            
+            name = parts[0].strip()
+            url = parts[1].strip() if len(parts) > 1 else ''
+            description = parts[2].strip() if len(parts) > 2 else ''
+            
+            # Clean name (remove quotes if present)
+            name = name.strip('"\'')
+            
+            # Clean URL (remove quotes if present, validate)
+            url = url.strip('"\'')
+            if not url.startswith('http://') and not url.startswith('https://'):
+                # Skip invalid URLs
+                continue
+            
+            # Clean description - remove section info if it was added previously
+            description = description.strip()
+            if description.startswith('[') and ']' in description:
+                # Remove section prefix if present
+                description = re.sub(r'^\[.*?\]\s*', '', description)
+            
             # Create or Update
             resource, created = NewsResource.objects.get_or_create(
                 name=name,
-                defaults=defaults
+                defaults={
+                    'url': url,
+                    'description': description,
+                    'section': current_region,
+                }
             )
             
             if not created:
-                for key, value in defaults.items():
-                    setattr(resource, key, value)
+                # Update existing resource
+                resource.url = url
+                resource.description = description
+                resource.section = current_region
                 resource.save()
+                count_updated += 1
+            else:
+                count_created += 1
 
-            if created:
-                count_resources += 1
-
-        self.stdout.write(self.style.SUCCESS(f'Successfully imported {count_resources} news resources.'))
+        self.stdout.write(
+            self.style.SUCCESS(
+                f'Successfully imported {count_created} new resources and updated {count_updated} existing resources.'
+            )
+        )
 

@@ -1,0 +1,255 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls static admin_modify %}
+
+{% block title %}{{ title }} | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:references_newsresource_changelist' %}">{% trans 'News Resources' %}</a>
+&rsaquo; {{ title }}
+</div>
+{% endblock %}
+
+{% block content %}
+<h1>{{ title }}</h1>
+
+<div id="discovery-info" style="margin: 20px 0;">
+    <h2>{% trans 'Search Parameters' %}</h2>
+    <ul>
+        <li><strong>{% trans 'Last search date' %}:</strong> {{ last_search_date|date:"d.m.Y" }}</li>
+        <li><strong>{% trans 'Search period' %}:</strong> {{ last_search_date|date:"d.m.Y" }} - {{ today|date:"d.m.Y" }}</li>
+        <li><strong>{% trans 'Total resources' %}:</strong> {{ resource_count }}</li>
+    </ul>
+</div>
+
+<div id="discovery-progress" style="display: none; margin: 20px 0;">
+    <h2>{% trans 'Search Progress' %}</h2>
+    <div style="background: #f0f0f0; border: 1px solid #ccc; border-radius: 4px; padding: 2px; margin: 10px 0;">
+        <div id="progress-bar" style="background: #417690; height: 30px; width: 0%; transition: width 0.3s; border-radius: 2px;"></div>
+    </div>
+    <p id="progress-text" style="margin: 10px 0;">{% trans 'Initializing...' %}</p>
+</div>
+
+<div id="discovery-form">
+    <form method="post" id="discover-form">
+        {% csrf_token %}
+        <div class="submit-row">
+            <input type="submit" value="{% trans 'Start Search' %}" class="default" id="start-button">
+            <a href="{% url 'admin:references_newsresource_changelist' %}" class="button">{% trans 'Cancel' %}</a>
+        </div>
+    </form>
+</div>
+
+<div id="discovery-results" style="display: none; margin: 20px 0;">
+    <h2>{% trans 'Search Results' %}</h2>
+    <div id="results-content"></div>
+    <div class="submit-row">
+        <a href="{% url 'admin:references_newsresource_changelist' %}" class="button">{% trans 'Back to Resources' %}</a>
+        <a href="{% url 'admin:news_newspost_changelist' %}" class="default">{% trans 'View News Posts' %}</a>
+    </div>
+</div>
+
+<script>
+(function() {
+    const form = document.getElementById('discover-form');
+    const progressDiv = document.getElementById('discovery-progress');
+    const formDiv = document.getElementById('discovery-form');
+    const resultsDiv = document.getElementById('discovery-results');
+    const progressBar = document.getElementById('progress-bar');
+    const progressText = document.getElementById('progress-text');
+    const startButton = document.getElementById('start-button');
+    
+    let pollInterval = null;
+    
+    form.addEventListener('submit', function(e) {
+        e.preventDefault();
+        
+        // Скрываем форму, показываем прогресс
+        formDiv.style.display = 'none';
+        progressDiv.style.display = 'block';
+        
+        // Отправляем POST запрос
+        const formData = new FormData(form);
+        formData.append('X-Requested-With', 'XMLHttpRequest');
+        
+        fetch(form.action, {
+            method: 'POST',
+            body: formData,
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'running') {
+                // Обновляем начальный прогресс
+                updateProgress(data);
+                // Начинаем опрос статуса
+                startPolling();
+            } else if (data.status === 'completed') {
+                stopPolling();
+                showResults(data);
+            } else if (data.status === 'error') {
+                stopPolling();
+                showError(data.message || 'Произошла ошибка при запуске поиска');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            stopPolling();
+            showError('Ошибка при запуске поиска: ' + error.message);
+        });
+    });
+    
+    function startPolling() {
+        pollInterval = setInterval(function() {
+            fetch('{% url "admin:references_newsresource_discover_status" %}', {
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                updateProgress(data);
+                
+                if (data.status === 'completed' || data.status === 'error') {
+                    stopPolling();
+                    if (data.status === 'completed') {
+                        // Запрашиваем финальные результаты
+                        fetchFinalResults();
+                    } else {
+                        showError('Произошла ошибка при поиске новостей');
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Polling error:', error);
+            });
+        }, 2000); // Опрос каждые 2 секунды
+    }
+    
+    function stopPolling() {
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+    }
+    
+    function updateProgress(data) {
+        const percent = data.percent || 0;
+        progressBar.style.width = percent + '%';
+        progressText.textContent = 'Обработано ' + data.processed + ' из ' + data.total + ' источников (' + percent + '%)';
+    }
+    
+    function fetchFinalResults() {
+        // Получаем финальный статус для отображения результатов
+        fetch('{% url "admin:references_newsresource_discover_status" %}', {
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+        })
+        .then(response => response.json())
+        .then(data => {
+            // Используем данные из статуса для отображения результатов
+            // Статистика будет доступна через последний статус
+            showResults({
+                created: 0, // Будет показано в сообщении админа
+                errors: 0,
+                total_processed: data.total || 0
+            });
+        })
+        .catch(error => {
+            showResults({
+                created: 0,
+                errors: 0,
+                total_processed: 0
+            });
+        });
+    }
+    
+    function showResults(data) {
+        progressDiv.style.display = 'none';
+        resultsDiv.style.display = 'block';
+        
+        const content = document.getElementById('results-content');
+        content.innerHTML = `
+            <div class="messagelist">
+                <ul class="messagelist">
+                    <li class="success">Поиск новостей завершен успешно!</li>
+                </ul>
+            </div>
+            <ul style="margin: 20px 0;">
+                <li><strong>Создано новостей:</strong> ${data.created || 0}</li>
+                <li><strong>Ошибок:</strong> ${data.errors || 0}</li>
+                <li><strong>Обработано источников:</strong> ${data.total_processed || 0}</li>
+            </ul>
+        `;
+    }
+    
+    function showError(message) {
+        progressDiv.style.display = 'none';
+        resultsDiv.style.display = 'block';
+        
+        const content = document.getElementById('results-content');
+        content.innerHTML = `
+            <div class="messagelist">
+                <ul class="messagelist">
+                    <li class="error">${message}</li>
+                </ul>
+            </div>
+        `;
+    }
+})();
+</script>
+
+<style>
+.submit-row {
+    padding: 12px 14px;
+    margin: 0 0 20px;
+    background: #f8f8f8;
+    border: 1px solid #eee;
+    border-radius: 4px;
+    text-align: right;
+}
+
+.submit-row input[type="submit"] {
+    margin-left: 10px;
+}
+
+.submit-row a.button {
+    margin-left: 10px;
+    padding: 10px 15px;
+    background: #417690;
+    color: white;
+    text-decoration: none;
+    border-radius: 4px;
+}
+
+.submit-row a.button:hover {
+    background: #205067;
+}
+
+.messagelist {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.messagelist li.success {
+    background: #dfd;
+    color: #030;
+    padding: 10px 12px;
+    border-left: 4px solid #5cb85c;
+    margin-bottom: 10px;
+}
+
+.messagelist li.error {
+    background: #fdd;
+    color: #300;
+    padding: 10px 12px;
+    border-left: 4px solid #d9534f;
+    margin-bottom: 10px;
+}
+</style>
+{% endblock %}

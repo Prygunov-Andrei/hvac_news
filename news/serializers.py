@@ -12,16 +12,68 @@ class NewsMediaSerializer(serializers.ModelSerializer):
 
 class NewsPostSerializer(serializers.ModelSerializer):
     media = NewsMediaSerializer(many=True, read_only=True)
-    author = UserSerializer(read_only=True)
+    author = serializers.SerializerMethodField()
+    
+    # Поля для многоязычности через modeltranslation (безопасная обработка)
+    title_ru = serializers.SerializerMethodField()
+    title_en = serializers.SerializerMethodField()
+    title_de = serializers.SerializerMethodField()
+    title_pt = serializers.SerializerMethodField()
+    body_ru = serializers.SerializerMethodField()
+    body_en = serializers.SerializerMethodField()
+    body_de = serializers.SerializerMethodField()
+    body_pt = serializers.SerializerMethodField()
+    
+    def get_author(self, obj):
+        """Безопасно возвращает автора или None"""
+        if obj.author:
+            return UserSerializer(obj.author).data
+        return None
 
     class Meta:
         model = NewsPost
         fields = (
             'id', 'title', 'title_ru', 'title_en', 'title_de', 'title_pt',
             'body', 'body_ru', 'body_en', 'body_de', 'body_pt',
-            'pub_date', 'status', 'source_language', 'created_at', 'updated_at', 'author', 'media'
+            'pub_date', 'status', 'source_language', 'source_url', 'created_at', 'updated_at', 'author', 'media',
+            'is_no_news_found', 'manufacturer'
         )
-        read_only_fields = ('id', 'created_at', 'updated_at', 'author', 'title_ru', 'title_en', 'title_de', 'title_pt', 'body_ru', 'body_en', 'body_de', 'body_pt')
+        read_only_fields = ('id', 'created_at', 'updated_at', 'author', 'title_ru', 'title_en', 'title_de', 'title_pt', 'body_ru', 'body_en', 'body_de', 'body_pt', 'is_no_news_found', 'manufacturer')
+    
+    def _get_translation_field(self, obj, field_name, lang_code):
+        """Безопасно получает значение поля перевода или None"""
+        try:
+            field_with_lang = f"{field_name}_{lang_code}"
+            if hasattr(obj, field_with_lang):
+                value = getattr(obj, field_with_lang, None)
+                return value if value else None
+        except (AttributeError, KeyError):
+            pass
+        return None
+    
+    def get_title_ru(self, obj):
+        return self._get_translation_field(obj, 'title', 'ru')
+    
+    def get_title_en(self, obj):
+        return self._get_translation_field(obj, 'title', 'en')
+    
+    def get_title_de(self, obj):
+        return self._get_translation_field(obj, 'title', 'de')
+    
+    def get_title_pt(self, obj):
+        return self._get_translation_field(obj, 'title', 'pt')
+    
+    def get_body_ru(self, obj):
+        return self._get_translation_field(obj, 'body', 'ru')
+    
+    def get_body_en(self, obj):
+        return self._get_translation_field(obj, 'body', 'en')
+    
+    def get_body_de(self, obj):
+        return self._get_translation_field(obj, 'body', 'de')
+    
+    def get_body_pt(self, obj):
+        return self._get_translation_field(obj, 'body', 'pt')
 
 
 class NewsPostWriteSerializer(serializers.ModelSerializer):

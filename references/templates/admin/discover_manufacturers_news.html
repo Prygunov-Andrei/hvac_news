@@ -1,0 +1,218 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block title %}{{ title }} | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block content %}
+<h1>{{ title }}</h1>
+
+<div id="discovery-container">
+    <div id="discovery-info" style="margin-bottom: 20px; padding: 15px; background: #f8f9fa; border-radius: 5px;">
+        <h3>Параметры поиска:</h3>
+        <p><strong>Период:</strong> <span id="period-start">{{ last_search_date|date:"d.m.Y" }}</span> - <span id="period-end">{{ today|date:"d.m.Y" }}</span></p>
+        <p><strong>Количество производителей:</strong> <span id="manufacturer-count">{{ manufacturer_count }}</span></p>
+    </div>
+
+    <div id="discovery-controls" style="margin-bottom: 20px;">
+        <button id="start-discovery-btn" class="button" style="padding: 10px 20px; font-size: 14px; background: #417690; color: white; border: none; border-radius: 3px; cursor: pointer;">
+            Начать поиск новостей
+        </button>
+        <button id="stop-discovery-btn" class="button" style="display: none; padding: 10px 20px; font-size: 14px; background: #ba2121; color: white; border: none; border-radius: 3px; cursor: pointer; margin-left: 10px;">
+            Остановить поиск
+        </button>
+    </div>
+
+    <div id="discovery-progress" style="display: none; margin-bottom: 20px;">
+        <div style="background: #e0e0e0; border-radius: 5px; height: 30px; position: relative; overflow: hidden;">
+            <div id="progress-bar" style="background: #417690; height: 100%; width: 0%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold;">
+                <span id="progress-text">0%</span>
+            </div>
+        </div>
+        <p style="margin-top: 10px;">
+            Обработано: <strong id="processed-count">0</strong> из <strong id="total-count">{{ manufacturer_count }}</strong>
+        </p>
+        <p id="status-text" style="color: #666; font-style: italic;">Готов к запуску...</p>
+    </div>
+
+    <div id="discovery-results" style="display: none; margin-top: 20px; padding: 15px; background: #f0f0f0; border-radius: 5px;">
+        <h3>Результаты поиска:</h3>
+        <p id="results-text"></p>
+    </div>
+</div>
+
+<script>
+(function() {
+    const startBtn = document.getElementById('start-discovery-btn');
+    const stopBtn = document.getElementById('stop-discovery-btn');
+    const progressDiv = document.getElementById('discovery-progress');
+    const progressBar = document.getElementById('progress-bar');
+    const progressText = document.getElementById('progress-text');
+    const processedCount = document.getElementById('processed-count');
+    const totalCount = document.getElementById('total-count');
+    const statusText = document.getElementById('status-text');
+    const resultsDiv = document.getElementById('discovery-results');
+    const resultsText = document.getElementById('results-text');
+    
+    let pollInterval = null;
+    let isRunning = false;
+
+    function getCookie(name) {
+        let cookieValue = null;
+        if (document.cookie && document.cookie !== '') {
+            const cookies = document.cookie.split(';');
+            for (let i = 0; i < cookies.length; i++) {
+                const cookie = cookies[i].trim();
+                if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                    cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                    break;
+                }
+            }
+        }
+        return cookieValue;
+    }
+
+    function getCSRFToken() {
+        return getCookie('csrftoken');
+    }
+
+    function updateProgress(data) {
+        const percent = data.percent || 0;
+        progressBar.style.width = percent + '%';
+        progressText.textContent = percent + '%';
+        processedCount.textContent = data.processed || 0;
+        totalCount.textContent = data.total || 0;
+        
+        if (data.status === 'running') {
+            statusText.textContent = 'Поиск выполняется...';
+            statusText.style.color = '#417690';
+        } else if (data.status === 'completed') {
+            statusText.textContent = 'Поиск завершен!';
+            statusText.style.color = '#28a745';
+            stopPolling();
+            startBtn.style.display = 'inline-block';
+            stopBtn.style.display = 'none';
+        } else if (data.status === 'error') {
+            statusText.textContent = 'Произошла ошибка при поиске';
+            statusText.style.color = '#ba2121';
+            stopPolling();
+            startBtn.style.display = 'inline-block';
+            stopBtn.style.display = 'none';
+        }
+    }
+
+    function pollStatus() {
+        fetch('discover-manufacturers-status/', {
+            method: 'GET',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+            },
+            credentials: 'same-origin'
+        })
+        .then(response => response.json())
+        .then(data => {
+            updateProgress(data);
+            if (data.status === 'running') {
+                // Продолжаем опрос
+            } else {
+                stopPolling();
+            }
+        })
+        .catch(error => {
+            console.error('Error polling status:', error);
+            stopPolling();
+        });
+    }
+
+    function startPolling() {
+        if (pollInterval) return;
+        pollInterval = setInterval(pollStatus, 2000); // Опрос каждые 2 секунды
+        pollStatus(); // Первый запрос сразу
+    }
+
+    function stopPolling() {
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+        isRunning = false;
+    }
+
+    startBtn.addEventListener('click', function() {
+        if (isRunning) return;
+        
+        isRunning = true;
+        startBtn.style.display = 'none';
+        stopBtn.style.display = 'inline-block';
+        progressDiv.style.display = 'block';
+        resultsDiv.style.display = 'none';
+        
+        fetch('discover-manufacturers-news/', {
+            method: 'POST',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRFToken': getCSRFToken(),
+            },
+            credentials: 'same-origin'
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'running') {
+                updateProgress(data);
+                startPolling();
+            } else {
+                alert('Ошибка запуска поиска');
+                isRunning = false;
+                startBtn.style.display = 'inline-block';
+                stopBtn.style.display = 'none';
+            }
+        })
+        .catch(error => {
+            console.error('Error starting discovery:', error);
+            alert('Ошибка при запуске поиска');
+            isRunning = false;
+            startBtn.style.display = 'inline-block';
+            stopBtn.style.display = 'none';
+        });
+    });
+
+    stopBtn.addEventListener('click', function() {
+        if (confirm('Вы уверены, что хотите остановить поиск?')) {
+            stopPolling();
+            isRunning = false;
+            startBtn.style.display = 'inline-block';
+            stopBtn.style.display = 'none';
+            statusText.textContent = 'Поиск остановлен пользователем';
+            statusText.style.color = '#ffc107';
+        }
+    });
+
+    // Загружаем информацию о периоде при загрузке страницы
+    fetch('discover-manufacturers-info/', {
+        method: 'GET',
+        headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+        },
+        credentials: 'same-origin'
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.period_start) {
+            const startDate = new Date(data.period_start);
+            document.getElementById('period-start').textContent = startDate.toLocaleDateString('ru-RU');
+        }
+        if (data.period_end) {
+            const endDate = new Date(data.period_end);
+            document.getElementById('period-end').textContent = endDate.toLocaleDateString('ru-RU');
+        }
+        if (data.total_manufacturers) {
+            document.getElementById('manufacturer-count').textContent = data.total_manufacturers;
+            totalCount.textContent = data.total_manufacturers;
+        }
+    })
+    .catch(error => {
+        console.error('Error loading discovery info:', error);
+    });
+})();
+</script>
+
+{% endblock %}

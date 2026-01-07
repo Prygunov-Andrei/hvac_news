@@ -25,7 +25,12 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-default-key-for-dev')
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,*.ngrok.io,*.ngrok-free.app,hvac-news.ngrok.io').split(',')
+# Parse ALLOWED_HOSTS from environment or use defaults
+_allowed_hosts_str = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,hvac-news.ngrok.io,finance.ngrok.app,hvac-news.online,www.hvac-news.online')
+ALLOWED_HOSTS = [host.strip() for host in _allowed_hosts_str.split(',') if host.strip()]
+# For development, allow all hosts if DEBUG is True
+if DEBUG:
+    ALLOWED_HOSTS = ['*']
 
 
 # Application definition
@@ -233,8 +238,13 @@ CSRF_TRUSTED_ORIGINS = [
     'https://*.ngrok-free.app',
     'https://*.ngrok.io',
     'https://hvac-news.ngrok.io',
+    'https://finance.ngrok.app',
     'https://*.trycloudflare.com',
     'https://hvac-news.trycloudflare.com',
+    'https://*.figma.site',
+    'https://*.figma.com',
+    'https://hvac-news.online',
+    'https://www.hvac-news.online',
 ]
 
 # Email Configuration
@@ -257,3 +267,15 @@ TRANSLATION_PROVIDER = os.getenv('TRANSLATION_PROVIDER', 'openai')  # 'openai', 
 TRANSLATION_API_KEY = os.getenv('TRANSLATION_API_KEY', '')
 TRANSLATION_MODEL = os.getenv('TRANSLATION_MODEL', 'gpt-4o-mini')  # OpenAI model
 TRANSLATION_ENABLED = os.getenv('TRANSLATION_ENABLED', 'True') == 'True'
+
+# News Discovery Configuration
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyC0jX3-k6XUwFQ8DrdY3EwzKfaf22uLiFk')
+NEWS_DISCOVERY_OPENAI_MODEL = os.getenv('NEWS_DISCOVERY_OPENAI_MODEL', 'gpt-5.2')  # GPT-5.2 Thinking для Chat Completions API (gpt-5.2-pro только в Responses API)
+NEWS_DISCOVERY_GEMINI_MODEL = os.getenv('NEWS_DISCOVERY_GEMINI_MODEL', 'gemini-3-pro-preview')  # Gemini 3 Pro с поддержкой веб-поиска
+NEWS_DISCOVERY_TIMEOUT = int(os.getenv('NEWS_DISCOVERY_TIMEOUT', '120'))  # Таймаут в секундах
+
+# Grok (xAI) Configuration
+XAI_API_KEY = os.getenv('XAI_API_KEY', 'YOUR_XAI_API_KEY')
+NEWS_DISCOVERY_GROK_MODEL = os.getenv('NEWS_DISCOVERY_GROK_MODEL', 'grok-4-1-fast')  # Grok 4.1 Fast с веб-поиском
+NEWS_DISCOVERY_USE_GROK = os.getenv('NEWS_DISCOVERY_USE_GROK', 'True') == 'True'  # Использовать Grok вместо OpenAI
+NEWS_DISCOVERY_USE_OPENAI_FALLBACK = os.getenv('NEWS_DISCOVERY_USE_OPENAI_FALLBACK', 'True') == 'True'  # Использовать OpenAI как резервный вариант

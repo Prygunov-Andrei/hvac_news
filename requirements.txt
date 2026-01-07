@@ -8,3 +8,5 @@ django-cors-headers>=4.3
 django-modeltranslation>=0.18
 requests>=2.31
 openai>=1.0
+google-generativeai>=0.3.0
+# xAI Grok использует OpenAI-совместимый API, поэтому xai-sdk не требуется (требует Python >= 3.10)

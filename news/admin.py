@@ -4,7 +4,7 @@ from django.urls import path
 from django.utils.html import format_html
 from django import forms
 from modeltranslation.admin import TranslationAdmin
-from .models import NewsPost, NewsMedia, Comment
+from .models import NewsPost, NewsMedia, Comment, NewsDiscoveryRun, NewsDiscoveryStatus
 from .services import NewsImportService
 
 class ImportNewsForm(forms.Form):
@@ -12,9 +12,29 @@ class ImportNewsForm(forms.Form):
 
 @admin.register(NewsPost)
 class NewsPostAdmin(TranslationAdmin):
-    list_display = ('title', 'pub_date', 'author', 'created_at')
+    list_display = ('title', 'source_url_link', 'pub_date', 'author', 'status', 'is_no_news_found', 'created_at')
     search_fields = ('title',)
+    list_filter = ('status', 'source_language', 'is_no_news_found', 'created_at')
+    readonly_fields = ('source_url_link', 'created_at', 'updated_at', 'is_no_news_found')
+    fieldsets = (
+        ('Основная информация', {
+            'fields': ('title', 'body', 'source_url', 'source_url_link', 'status', 'source_language', 'author', 'pub_date')
+        }),
+        ('Метаданные', {
+            'fields': ('created_at', 'updated_at', 'is_no_news_found'),
+            'classes': ('collapse',)
+        }),
+    )
     change_list_template = "admin/news_changelist.html"
+    
+    def source_url_link(self, obj):
+        """Отображает source_url как кликабельную ссылку"""
+        if obj.source_url:
+            return format_html('<a href="{}" target="_blank" rel="noopener noreferrer">{}</a>', 
+                             obj.source_url, obj.source_url[:60] + '...' if len(obj.source_url) > 60 else obj.source_url)
+        return '-'
+    source_url_link.short_description = 'Источник'
+    source_url_link.admin_order_field = 'source_url'
 
     def get_urls(self):
         urls = super().get_urls()
@@ -76,3 +96,21 @@ class CommentAdmin(admin.ModelAdmin):
     def text_preview(self, obj):
         return obj.text[:100] + '...' if len(obj.text) > 100 else obj.text
     text_preview.short_description = 'Text Preview'
+
+
+@admin.register(NewsDiscoveryRun)
+class NewsDiscoveryRunAdmin(admin.ModelAdmin):
+    list_display = ('last_search_date', 'created_at', 'updated_at')
+    readonly_fields = ('created_at', 'updated_at')
+    list_filter = ('last_search_date',)
+
+
+@admin.register(NewsDiscoveryStatus)
+class NewsDiscoveryStatusAdmin(admin.ModelAdmin):
+    list_display = ('status', 'processed_count', 'total_count', 'get_progress_percent_display', 'created_at', 'updated_at')
+    readonly_fields = ('created_at', 'updated_at', 'get_progress_percent_display')
+    list_filter = ('status', 'created_at')
+    
+    def get_progress_percent_display(self, obj):
+        return f"{obj.get_progress_percent()}%"
+    get_progress_percent_display.short_description = 'Progress'

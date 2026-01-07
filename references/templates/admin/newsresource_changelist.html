@@ -1,0 +1,23 @@
+{% extends "admin/change_list.html" %}
+{% block object-tools-items %}
+    <li>
+        <a href="discover-news/" class="addlink">Найти новости</a>
+    </li>
+    <li>
+        <form method="post" action="" style="display: inline;">
+            {% csrf_token %}
+            <button type="submit" name="clear_all" class="deletelink" style="background: none; border: none; color: #ba2121; cursor: pointer; padding: 0; text-decoration: underline;" onclick="return confirm('Вы уверены, что хотите удалить все ресурсы?');">
+                Очистить все ресурсы
+            </button>
+        </form>
+    </li>
+    <li>
+        <form method="post" action="" style="display: inline;">
+            {% csrf_token %}
+            <button type="submit" name="import_from_file" class="addlink" style="background: none; border: none; color: #417690; cursor: pointer; padding: 0; text-decoration: underline;">
+                Импортировать ресурсы из файла
+            </button>
+        </form>
+    </li>
+    {{ block.super }}
+{% endblock %}

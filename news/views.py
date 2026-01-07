@@ -29,6 +29,7 @@ class NewsPostViewSet(viewsets.ModelViewSet):
         """
         Админы видят все новости (включая будущие, черновики и запланированные).
         Обычные пользователи видят только опубликованные новости (status=published и pub_date <= now).
+        Поддерживает фильтрацию по is_no_news_found через query parameter.
         """
         queryset = NewsPost.objects.select_related('author').prefetch_related('media').all()
         
@@ -38,6 +39,13 @@ class NewsPostViewSet(viewsets.ModelViewSet):
                 status='published',
                 pub_date__lte=timezone.now()
             )
+        
+        # Фильтрация по is_no_news_found (для массового удаления на фронтенде)
+        is_no_news_found = self.request.query_params.get('is_no_news_found', None)
+        if is_no_news_found is not None:
+            # Преобразуем строку в boolean
+            is_no_news_found_bool = is_no_news_found.lower() in ('true', '1', 'yes')
+            queryset = queryset.filter(is_no_news_found=is_no_news_found_bool)
         
         return queryset
     
