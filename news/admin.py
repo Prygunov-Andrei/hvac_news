@@ -4,7 +4,10 @@ from django.urls import path
 from django.utils.html import format_html
 from django import forms
 from modeltranslation.admin import TranslationAdmin
-from .models import NewsPost, NewsMedia, Comment, NewsDiscoveryRun, NewsDiscoveryStatus
+from .models import (
+    NewsPost, NewsMedia, Comment, NewsDiscoveryRun, NewsDiscoveryStatus,
+    SearchConfiguration, DiscoveryAPICall
+)
 from .services import NewsImportService
 
 class ImportNewsForm(forms.Form):
@@ -98,18 +101,152 @@ class CommentAdmin(admin.ModelAdmin):
     text_preview.short_description = 'Text Preview'
 
 
+@admin.register(SearchConfiguration)
+class SearchConfigurationAdmin(admin.ModelAdmin):
+    list_display = ('name', 'is_active', 'primary_provider', 'grok_model', 'max_search_results', 
+                    'temperature', 'updated_at')
+    list_filter = ('is_active', 'primary_provider')
+    search_fields = ('name',)
+    readonly_fields = ('created_at', 'updated_at')
+    
+    fieldsets = (
+        ('Основные настройки', {
+            'fields': ('name', 'is_active')
+        }),
+        ('Провайдеры', {
+            'fields': ('primary_provider', 'fallback_chain')
+        }),
+        ('Параметры LLM', {
+            'fields': ('temperature', 'timeout', 'max_news_per_resource', 'delay_between_requests')
+        }),
+        ('Grok Web Search', {
+            'fields': ('max_search_results', 'search_context_size')
+        }),
+        ('Модели', {
+            'fields': ('grok_model', 'anthropic_model', 'gemini_model', 'openai_model'),
+            'classes': ('collapse',)
+        }),
+        ('Тарифы Grok (USD за 1M токенов)', {
+            'fields': ('grok_input_price', 'grok_output_price'),
+            'classes': ('collapse',)
+        }),
+        ('Тарифы Anthropic (USD за 1M токенов)', {
+            'fields': ('anthropic_input_price', 'anthropic_output_price'),
+            'classes': ('collapse',)
+        }),
+        ('Тарифы Gemini (USD за 1M токенов)', {
+            'fields': ('gemini_input_price', 'gemini_output_price'),
+            'classes': ('collapse',)
+        }),
+        ('Тарифы OpenAI (USD за 1M токенов)', {
+            'fields': ('openai_input_price', 'openai_output_price'),
+            'classes': ('collapse',)
+        }),
+        ('Метаданные', {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+
+
 @admin.register(NewsDiscoveryRun)
 class NewsDiscoveryRunAdmin(admin.ModelAdmin):
-    list_display = ('last_search_date', 'created_at', 'updated_at')
-    readonly_fields = ('created_at', 'updated_at')
-    list_filter = ('last_search_date',)
+    list_display = ('id', 'last_search_date', 'news_found', 'estimated_cost_display', 
+                    'duration_display', 'efficiency_display', 'created_at')
+    readonly_fields = ('created_at', 'updated_at', 'config_snapshot', 'provider_stats',
+                       'started_at', 'finished_at', 'total_requests', 'total_input_tokens',
+                       'total_output_tokens', 'estimated_cost_usd', 'news_found', 
+                       'news_duplicates', 'resources_processed', 'resources_failed',
+                       'duration_display', 'efficiency_display')
+    list_filter = ('last_search_date', 'created_at')
+    
+    fieldsets = (
+        ('Результаты', {
+            'fields': ('last_search_date', 'news_found', 'news_duplicates', 
+                       'resources_processed', 'resources_failed')
+        }),
+        ('Время', {
+            'fields': ('started_at', 'finished_at', 'duration_display')
+        }),
+        ('Стоимость и токены', {
+            'fields': ('estimated_cost_usd', 'total_requests', 'total_input_tokens', 
+                       'total_output_tokens', 'efficiency_display')
+        }),
+        ('Статистика по провайдерам', {
+            'fields': ('provider_stats',),
+            'classes': ('collapse',)
+        }),
+        ('Конфигурация', {
+            'fields': ('config_snapshot',),
+            'classes': ('collapse',)
+        }),
+        ('Метаданные', {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def estimated_cost_display(self, obj):
+        return f"${obj.estimated_cost_usd:.4f}"
+    estimated_cost_display.short_description = 'Cost (USD)'
+    estimated_cost_display.admin_order_field = 'estimated_cost_usd'
+    
+    def duration_display(self, obj):
+        return obj.get_duration_display()
+    duration_display.short_description = 'Duration'
+    
+    def efficiency_display(self, obj):
+        eff = obj.get_efficiency()
+        if eff > 0:
+            return f"{eff:.1f} news/$"
+        return "-"
+    efficiency_display.short_description = 'Efficiency'
+
+
+class DiscoveryAPICallInline(admin.TabularInline):
+    model = DiscoveryAPICall
+    extra = 0
+    readonly_fields = ('provider', 'model', 'input_tokens', 'output_tokens', 
+                       'cost_usd', 'duration_ms', 'success', 'news_extracted', 'created_at')
+    fields = ('provider', 'resource', 'input_tokens', 'output_tokens', 
+              'cost_usd', 'duration_ms', 'success', 'news_extracted')
+    can_delete = False
+    
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(DiscoveryAPICall)
+class DiscoveryAPICallAdmin(admin.ModelAdmin):
+    list_display = ('id', 'provider', 'model', 'resource_name', 'input_tokens', 
+                    'output_tokens', 'cost_display', 'duration_ms', 'success', 
+                    'news_extracted', 'created_at')
+    list_filter = ('provider', 'success', 'created_at')
+    search_fields = ('resource__name', 'manufacturer__name', 'error_message')
+    readonly_fields = ('discovery_run', 'resource', 'manufacturer', 'provider', 'model',
+                       'input_tokens', 'output_tokens', 'cost_usd', 'duration_ms',
+                       'success', 'error_message', 'news_extracted', 'created_at')
+    
+    def resource_name(self, obj):
+        if obj.resource:
+            return obj.resource.name
+        if obj.manufacturer:
+            return f"[M] {obj.manufacturer.name}"
+        return "-"
+    resource_name.short_description = 'Resource'
+    
+    def cost_display(self, obj):
+        return f"${obj.cost_usd:.6f}"
+    cost_display.short_description = 'Cost'
+    cost_display.admin_order_field = 'cost_usd'
 
 
 @admin.register(NewsDiscoveryStatus)
 class NewsDiscoveryStatusAdmin(admin.ModelAdmin):
-    list_display = ('status', 'processed_count', 'total_count', 'get_progress_percent_display', 'created_at', 'updated_at')
+    list_display = ('status', 'search_type', 'provider', 'processed_count', 'total_count', 
+                    'get_progress_percent_display', 'created_at', 'updated_at')
     readonly_fields = ('created_at', 'updated_at', 'get_progress_percent_display')
-    list_filter = ('status', 'created_at')
+    list_filter = ('status', 'search_type', 'provider', 'created_at')
     
     def get_progress_percent_display(self, obj):
         return f"{obj.get_progress_percent()}%"

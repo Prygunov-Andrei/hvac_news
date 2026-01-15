@@ -1,3 +1,4 @@
+import logging
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -5,6 +6,8 @@ from django.db.models import Sum, Avg, Count, Q
 from django.utils import timezone
 from datetime import timedelta
 from .models import Manufacturer, Brand, NewsResource, NewsResourceStatistics, ManufacturerStatistics
+
+logger = logging.getLogger(__name__)
 from .serializers import (
     ManufacturerSerializer, BrandSerializer, NewsResourceSerializer, NewsResourceStatisticsSerializer,
     ManufacturerStatisticsSerializer
@@ -242,9 +245,124 @@ class NewsResourceViewSet(viewsets.ModelViewSet):
         """
         Разрешает чтение всем, но требует аутентификации для записи.
         """
-        if self.action in ['list', 'retrieve', 'statistics_summary']:
+        if self.action in ['list', 'retrieve', 'statistics_summary', 'available_providers']:
             return [permissions.AllowAny()]
         return [permissions.IsAuthenticated()]
+    
+    @action(detail=False, methods=['get'])
+    def available_providers(self, request):
+        """
+        Возвращает список доступных провайдеров LLM для поиска новостей.
+        """
+        from django.conf import settings
+        
+        providers = []
+        
+        # Проверяем доступность каждого провайдера
+        if getattr(settings, 'XAI_API_KEY', ''):
+            providers.append({
+                'id': 'grok',
+                'name': 'Grok 4.1 Fast',
+                'description': 'Самый экономичный вариант (~$0.13 за 220 ресурсов)',
+                'available': True
+            })
+        else:
+            providers.append({
+                'id': 'grok',
+                'name': 'Grok 4.1 Fast',
+                'description': 'Самый экономичный вариант (~$0.13 за 220 ресурсов)',
+                'available': False
+            })
+        
+        if getattr(settings, 'ANTHROPIC_API_KEY', ''):
+            providers.append({
+                'id': 'anthropic',
+                'name': 'Anthropic Claude Haiku 4.5',
+                'description': 'Экономичный вариант от Anthropic (~$4.26 за 220 ресурсов)',
+                'available': True
+            })
+        else:
+            providers.append({
+                'id': 'anthropic',
+                'name': 'Anthropic Claude Haiku 4.5',
+                'description': 'Экономичный вариант от Anthropic (~$4.26 за 220 ресурсов)',
+                'available': False
+            })
+        
+        if getattr(settings, 'TRANSLATION_API_KEY', ''):
+            providers.append({
+                'id': 'openai',
+                'name': 'OpenAI GPT-5.2',
+                'description': 'Резервный вариант (~$6.35 за 220 ресурсов)',
+                'available': True
+            })
+        else:
+            providers.append({
+                'id': 'openai',
+                'name': 'OpenAI GPT-5.2',
+                'description': 'Резервный вариант (~$6.35 за 220 ресурсов)',
+                'available': False
+            })
+        
+        # Всегда доступен автоматический выбор
+        providers.insert(0, {
+            'id': 'auto',
+            'name': 'Автоматический выбор (цепочка)',
+            'description': 'Использует цепочку: Grok → Anthropic → OpenAI',
+            'available': True
+        })
+        
+        return Response({
+            'providers': providers,
+            'default': 'auto'
+        })
+    
+    @action(detail=True, methods=['post'])
+    def discover_news(self, request, pk=None):
+        """
+        Запускает поиск новостей для конкретного источника.
+        
+        Параметры POST:
+        - provider (string, опционально): ID провайдера ('auto', 'grok', 'anthropic', 'openai')
+        """
+        from news.discovery_service import NewsDiscoveryService
+        from news.models import NewsDiscoveryStatus
+        
+        resource = self.get_object()
+        
+        # Проверяем, что источник не требует ручного ввода
+        if resource.source_type == NewsResource.SOURCE_TYPE_MANUAL:
+            return Response({
+                'error': 'Этот источник требует ручного ввода и не может быть обработан автоматически'
+            }, status=400)
+        
+        # Получаем выбранный провайдер
+        provider = request.data.get('provider', 'auto')
+        if provider not in ['auto', 'grok', 'anthropic', 'openai']:
+            provider = 'auto'
+        
+        # Запускаем поиск в фоне
+        import threading
+        
+        def run_discovery():
+            try:
+                service = NewsDiscoveryService(user=request.user)
+                created, errors, error_msg = service.discover_news_for_resource(resource, provider=provider)
+                logger.info(f"Discovery completed for resource {resource.id}: created={created}, errors={errors}, provider={provider}")
+            except Exception as e:
+                logger.error(f"Error during single resource discovery: {str(e)}")
+        
+        thread = threading.Thread(target=run_discovery)
+        thread.daemon = True
+        thread.start()
+        
+        return Response({
+            'status': 'running',
+            'resource_id': resource.id,
+            'resource_name': resource.name,
+            'provider': provider,
+            'message': f'Поиск новостей запущен для источника "{resource.name}"'
+        })
     
     def get_queryset(self):
         """Поддерживает фильтрацию и сортировку по статистике"""

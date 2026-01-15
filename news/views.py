@@ -2,10 +2,18 @@ import logging
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from django.utils import timezone
 from django.conf import settings
-from .models import NewsPost, Comment, MediaUpload
-from .serializers import NewsPostSerializer, NewsPostWriteSerializer, CommentSerializer, MediaUploadSerializer
+from django.db.models import Sum, Avg, Count
+from decimal import Decimal
+from .models import NewsPost, Comment, MediaUpload, SearchConfiguration, NewsDiscoveryRun, DiscoveryAPICall
+from .serializers import (
+    NewsPostSerializer, NewsPostWriteSerializer, CommentSerializer, MediaUploadSerializer,
+    SearchConfigurationSerializer, SearchConfigurationListSerializer,
+    NewsDiscoveryRunSerializer, NewsDiscoveryRunListSerializer,
+    DiscoveryAPICallSerializer, DiscoveryStatsSerializer
+)
 from .translation_service import TranslationService
 
 logger = logging.getLogger(__name__)
@@ -249,3 +257,181 @@ class MediaUploadViewSet(viewsets.ModelViewSet):
         context = super().get_serializer_context()
         context['request'] = self.request
         return context
+
+
+class SearchConfigurationViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet для управления конфигурациями поиска.
+    Только администраторы могут просматривать и редактировать конфигурации.
+    """
+    permission_classes = [permissions.IsAdminUser]
+    
+    def get_queryset(self):
+        return SearchConfiguration.objects.all()
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return SearchConfigurationListSerializer
+        return SearchConfigurationSerializer
+    
+    @action(detail=False, methods=['get'])
+    def active(self, request):
+        """Получить активную конфигурацию"""
+        config = SearchConfiguration.get_active()
+        serializer = SearchConfigurationSerializer(config)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def activate(self, request, pk=None):
+        """Активировать конфигурацию"""
+        config = self.get_object()
+        config.is_active = True
+        config.save()
+        return Response({'status': 'activated', 'id': config.id, 'name': config.name})
+    
+    @action(detail=True, methods=['post'])
+    def duplicate(self, request, pk=None):
+        """Дублировать конфигурацию для тестирования"""
+        original = self.get_object()
+        # Создаем копию
+        original.pk = None
+        original.id = None
+        original.name = f"{original.name} (copy)"
+        original.is_active = False
+        original.save()
+        serializer = SearchConfigurationSerializer(original)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class NewsDiscoveryRunViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet для просмотра истории запусков поиска.
+    Только администраторы могут просматривать историю.
+    """
+    permission_classes = [permissions.IsAdminUser]
+    
+    def get_queryset(self):
+        return NewsDiscoveryRun.objects.all()
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return NewsDiscoveryRunListSerializer
+        return NewsDiscoveryRunSerializer
+    
+    @action(detail=True, methods=['get'])
+    def api_calls(self, request, pk=None):
+        """Получить все API вызовы для запуска"""
+        run = self.get_object()
+        calls = run.api_calls.all()
+        serializer = DiscoveryAPICallSerializer(calls, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def stats(self, request):
+        """Получить агрегированную статистику по всем запускам"""
+        runs = NewsDiscoveryRun.objects.all()
+        
+        # Период фильтрации
+        days = request.query_params.get('days', None)
+        if days:
+            try:
+                days_int = int(days)
+                from_date = timezone.now() - timezone.timedelta(days=days_int)
+                runs = runs.filter(created_at__gte=from_date)
+            except ValueError:
+                pass
+        
+        # Агрегация
+        aggregates = runs.aggregate(
+            total_runs=Count('id'),
+            total_news_found=Sum('news_found'),
+            total_cost_usd=Sum('estimated_cost_usd'),
+            total_requests=Sum('total_requests'),
+            total_input_tokens=Sum('total_input_tokens'),
+            total_output_tokens=Sum('total_output_tokens'),
+        )
+        
+        # Расчет средних значений
+        total_runs = aggregates['total_runs'] or 0
+        total_news = aggregates['total_news_found'] or 0
+        total_cost = aggregates['total_cost_usd'] or Decimal('0')
+        
+        avg_efficiency = 0
+        if total_cost > 0:
+            avg_efficiency = float(total_news / float(total_cost))
+        
+        avg_cost_per_run = Decimal('0')
+        if total_runs > 0:
+            avg_cost_per_run = total_cost / total_runs
+        
+        # Статистика по провайдерам (агрегация из всех provider_stats)
+        provider_breakdown = {}
+        for run in runs:
+            if run.provider_stats:
+                for provider, stats in run.provider_stats.items():
+                    if provider not in provider_breakdown:
+                        provider_breakdown[provider] = {
+                            'requests': 0,
+                            'input_tokens': 0,
+                            'output_tokens': 0,
+                            'cost': 0,
+                            'errors': 0
+                        }
+                    for key in ['requests', 'input_tokens', 'output_tokens', 'cost', 'errors']:
+                        provider_breakdown[provider][key] += stats.get(key, 0)
+        
+        result = {
+            'total_runs': total_runs,
+            'total_news_found': total_news,
+            'total_cost_usd': total_cost,
+            'total_requests': aggregates['total_requests'] or 0,
+            'total_input_tokens': aggregates['total_input_tokens'] or 0,
+            'total_output_tokens': aggregates['total_output_tokens'] or 0,
+            'avg_efficiency': avg_efficiency,
+            'avg_cost_per_run': avg_cost_per_run,
+            'provider_breakdown': provider_breakdown
+        }
+        
+        serializer = DiscoveryStatsSerializer(result)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def latest(self, request):
+        """Получить последний запуск"""
+        run = NewsDiscoveryRun.objects.first()
+        if run:
+            serializer = NewsDiscoveryRunSerializer(run)
+            return Response(serializer.data)
+        return Response({'detail': 'No discovery runs found'}, status=status.HTTP_404_NOT_FOUND)
+
+
+class DiscoveryAPICallViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet для просмотра записей API вызовов.
+    Только администраторы могут просматривать записи.
+    """
+    serializer_class = DiscoveryAPICallSerializer
+    permission_classes = [permissions.IsAdminUser]
+    
+    def get_queryset(self):
+        queryset = DiscoveryAPICall.objects.select_related(
+            'discovery_run', 'resource', 'manufacturer'
+        ).all()
+        
+        # Фильтрация по провайдеру
+        provider = self.request.query_params.get('provider', None)
+        if provider:
+            queryset = queryset.filter(provider=provider)
+        
+        # Фильтрация по успешности
+        success = self.request.query_params.get('success', None)
+        if success is not None:
+            success_bool = success.lower() in ('true', '1', 'yes')
+            queryset = queryset.filter(success=success_bool)
+        
+        # Фильтрация по run_id
+        run_id = self.request.query_params.get('run_id', None)
+        if run_id:
+            queryset = queryset.filter(discovery_run_id=run_id)
+        
+        return queryset

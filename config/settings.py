@@ -279,3 +279,9 @@ XAI_API_KEY = os.getenv('XAI_API_KEY', '')  # xAI (Grok) API key
 NEWS_DISCOVERY_GROK_MODEL = os.getenv('NEWS_DISCOVERY_GROK_MODEL', 'grok-4-1-fast')  # Grok 4.1 Fast с веб-поиском
 NEWS_DISCOVERY_USE_GROK = os.getenv('NEWS_DISCOVERY_USE_GROK', 'True') == 'True'  # Использовать Grok вместо OpenAI
 NEWS_DISCOVERY_USE_OPENAI_FALLBACK = os.getenv('NEWS_DISCOVERY_USE_OPENAI_FALLBACK', 'True') == 'True'  # Использовать OpenAI как резервный вариант
+
+# Anthropic (Claude) Configuration
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')  # Anthropic (Claude) API key
+NEWS_DISCOVERY_ANTHROPIC_MODEL = os.getenv('NEWS_DISCOVERY_ANTHROPIC_MODEL', 'claude-sonnet-4-5-20250929')  # Claude Sonnet 4.5 с веб-поиском (более мощная модель)
+NEWS_DISCOVERY_USE_ANTHROPIC = os.getenv('NEWS_DISCOVERY_USE_ANTHROPIC', 'False') == 'True'  # Использовать Anthropic как дополнительный провайдер
+NEWS_DISCOVERY_ANTHROPIC_PRIORITY = int(os.getenv('NEWS_DISCOVERY_ANTHROPIC_PRIORITY', '2'))  # Приоритет в цепочке: 1=после Grok, 2=после Grok и перед OpenAI

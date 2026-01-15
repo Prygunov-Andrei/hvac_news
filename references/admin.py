@@ -163,9 +163,14 @@ class ManufacturerAdmin(TranslationAdmin):
         request.user = user
         
         if request.method == 'POST':
+            # Получаем выбранный провайдер из POST запроса
+            provider = request.POST.get('provider', 'auto')
+            if provider not in ['auto', 'grok', 'anthropic', 'openai']:
+                provider = 'auto'
+            
             # Создаем статус для отслеживания прогресса
             manufacturer_count = Manufacturer.objects.count()
-            status_obj = NewsDiscoveryStatus.create_new_status(manufacturer_count, search_type='manufacturers')
+            status_obj = NewsDiscoveryStatus.create_new_status(manufacturer_count, search_type='manufacturers', provider=provider)
             
             # Если это AJAX запрос - запускаем поиск в фоне
             if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
@@ -298,7 +303,7 @@ class NewsResourceAdmin(TranslationAdmin):
     search_fields = ('name', 'url', 'description', 'section')
     list_filter = ('language', 'source_type', 'section', 'statistics__is_active', 'statistics__error_rate')
     list_per_page = 50
-    actions = ['delete_selected', 'mark_as_manual', 'mark_as_auto', 'mark_as_hybrid']
+    actions = ['delete_selected', 'mark_as_manual', 'mark_as_auto', 'mark_as_hybrid', 'discover_selected_resources']
     ordering = ['-statistics__ranking_score', 'name']
     fieldsets = (
         (_('Основная информация'), {
@@ -387,6 +392,77 @@ class NewsResourceAdmin(TranslationAdmin):
         updated = queryset.update(source_type='hybrid')
         self.message_user(request, f'{updated} источников помечены как "Гибридный"')
     
+    @admin.action(description=_('Запустить поиск новостей для выбранных источников'))
+    def discover_selected_resources(self, request, queryset):
+        """Запускает поиск новостей для выбранных источников"""
+        from news.discovery_service import NewsDiscoveryService
+        
+        # Получаем выбранный провайдер из POST запроса (может быть передан через action_form)
+        provider = request.POST.get('provider', 'auto')
+        if provider not in ['auto', 'grok', 'anthropic', 'openai']:
+            provider = 'auto'
+        
+        # Фильтруем только источники с автоматическим или гибридным поиском
+        resources = queryset.exclude(source_type=NewsResource.SOURCE_TYPE_MANUAL)
+        resource_ids = list(resources.values_list('id', flat=True))
+        
+        if not resource_ids:
+            self.message_user(
+                request,
+                _('Нет источников для поиска. Все выбранные источники требуют ручного ввода.'),
+                level=messages.WARNING
+            )
+            return
+        
+        # Создаем статус для отслеживания прогресса
+        status_obj = NewsDiscoveryStatus.create_new_status(
+            total_count=len(resource_ids),
+            search_type='resources',
+            provider=provider
+        )
+        
+        # Запускаем поиск в фоне
+        import threading
+        
+        def run_discovery():
+            try:
+                service = NewsDiscoveryService(user=request.user)
+                # Обрабатываем только выбранные источники
+                for resource_id in resource_ids:
+                    try:
+                        resource = NewsResource.objects.get(id=resource_id)
+                        service.discover_news_for_resource(resource, provider=provider)
+                        # Обновляем прогресс
+                        status_obj.processed_count += 1
+                        status_obj.save()
+                    except NewsResource.DoesNotExist:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing resource {resource_id}: {str(e)}")
+                        status_obj.processed_count += 1
+                        status_obj.save()
+                
+                status_obj.status = 'completed'
+                status_obj.save()
+            except Exception as e:
+                logger.error(f"Error during selected resources discovery: {str(e)}")
+                status_obj.status = 'error'
+                status_obj.save()
+        
+        thread = threading.Thread(target=run_discovery)
+        thread.daemon = True
+        thread.start()
+        
+        provider_display = dict(NewsDiscoveryStatus._meta.get_field('provider').choices).get(provider, provider)
+        self.message_user(
+            request,
+            _('Поиск новостей запущен для {} источников. Провайдер: {}').format(
+                len(resource_ids),
+                provider_display
+            ),
+            level=messages.SUCCESS
+        )
+    
     def get_urls(self):
         urls = super().get_urls()
         from django.urls import path
@@ -407,10 +483,16 @@ class NewsResourceAdmin(TranslationAdmin):
             """View-обертка для discover_news_info с JWT поддержкой"""
             return self.discover_news_info(request)
         
+        @csrf_exempt
+        def discover_single_resource_wrapper(request, resource_id):
+            """View-обертка для discover_single_resource с JWT поддержкой"""
+            return self.discover_single_resource(request, resource_id)
+        
         my_urls = [
             path('discover-news/', discover_news_wrapper, name='references_newsresource_discover'),
             path('discover-news-status/', discover_news_status_wrapper, name='references_newsresource_discover_status'),
             path('discover-news-info/', discover_news_info_wrapper, name='references_newsresource_discover_info'),
+            path('<int:resource_id>/discover/', discover_single_resource_wrapper, name='references_newsresource_discover_single'),
         ]
         return my_urls + urls
     
@@ -436,9 +518,14 @@ class NewsResourceAdmin(TranslationAdmin):
         request.user = user
         
         if request.method == 'POST':
+            # Получаем выбранный провайдер из POST запроса
+            provider = request.POST.get('provider', 'auto')
+            if provider not in ['auto', 'grok', 'anthropic', 'openai']:
+                provider = 'auto'
+            
             # Создаем статус для отслеживания прогресса
             resource_count = NewsResource.objects.count()
-            status_obj = NewsDiscoveryStatus.create_new_status(resource_count, search_type='resources')
+            status_obj = NewsDiscoveryStatus.create_new_status(resource_count, search_type='resources', provider=provider)
             
             # Если это AJAX запрос - запускаем поиск в фоне и возвращаем статус
             if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
@@ -504,6 +591,123 @@ class NewsResourceAdmin(TranslationAdmin):
         }
         return render(request, 'admin/discover_news.html', context)
     
+    def discover_single_resource(self, request, resource_id):
+        """Запускает поиск новостей для одного источника"""
+        from news.discovery_service import NewsDiscoveryService
+        
+        # Аутентификация через JWT или session
+        user = authenticate_jwt_request(request)
+        if not user:
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                return JsonResponse({'error': 'Authentication required'}, status=401)
+            from django.contrib.auth.views import redirect_to_login
+            return redirect_to_login(request.get_full_path())
+        
+        # Проверка прав администратора
+        if not user.is_staff:
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                return JsonResponse({'error': 'Admin privileges required'}, status=403)
+            return JsonResponse({'error': 'Permission denied'}, status=403)
+        
+        request.user = user
+        
+        try:
+            resource = NewsResource.objects.get(id=resource_id)
+        except NewsResource.DoesNotExist:
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                return JsonResponse({'error': 'Resource not found'}, status=404)
+            self.message_user(request, _('Источник не найден'), level=messages.ERROR)
+            from django.shortcuts import redirect
+            return redirect('admin:references_newsresource_changelist')
+        
+        # Проверяем, что источник не требует ручного ввода
+        if resource.source_type == NewsResource.SOURCE_TYPE_MANUAL:
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                return JsonResponse({
+                    'error': 'Этот источник требует ручного ввода и не может быть обработан автоматически'
+                }, status=400)
+            self.message_user(
+                request,
+                _('Источник "{}" требует ручного ввода и не может быть обработан автоматически').format(resource.name),
+                level=messages.WARNING
+            )
+            from django.shortcuts import redirect
+            return redirect('admin:references_newsresource_change', resource_id)
+        
+        if request.method == 'POST':
+            # Получаем выбранный провайдер из POST запроса
+            provider = request.POST.get('provider', 'auto')
+            if provider not in ['auto', 'grok', 'anthropic', 'openai']:
+                provider = 'auto'
+            
+            # Если это AJAX запрос - запускаем поиск в фоне
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                import threading
+                
+                def run_discovery():
+                    try:
+                        service = NewsDiscoveryService(user=request.user)
+                        created, errors, error_msg = service.discover_news_for_resource(resource, provider=provider)
+                        logger.info(f"Discovery completed for resource {resource_id}: created={created}, errors={errors}")
+                    except Exception as e:
+                        logger.error(f"Error during single resource discovery: {str(e)}")
+                
+                thread = threading.Thread(target=run_discovery)
+                thread.daemon = True
+                thread.start()
+                
+                return JsonResponse({
+                    'status': 'running',
+                    'resource_id': resource_id,
+                    'resource_name': resource.name,
+                    'provider': provider,
+                    'message': _('Поиск новостей запущен для источника "{}"').format(resource.name)
+                })
+            
+            # Если это обычный POST - запускаем синхронно
+            try:
+                service = NewsDiscoveryService(user=request.user)
+                created, errors, error_msg = service.discover_news_for_resource(resource, provider=provider)
+                
+                if error_msg:
+                    self.message_user(
+                        request,
+                        _('Ошибка при поиске новостей для источника "{}": {}').format(resource.name, error_msg),
+                        level=messages.ERROR
+                    )
+                else:
+                    self.message_user(
+                        request,
+                        _('Поиск новостей завершен для источника "{}". Создано: {}, ошибок: {}').format(
+                            resource.name, created, errors
+                        ),
+                        level=messages.SUCCESS
+                    )
+            except Exception as e:
+                logger.error(f"Error during single resource discovery: {str(e)}")
+                self.message_user(
+                    request,
+                    _('Ошибка при поиске новостей: {}').format(str(e)),
+                    level=messages.ERROR
+                )
+            
+            from django.shortcuts import redirect
+            return redirect('admin:references_newsresource_change', resource_id)
+        
+        # GET запрос - показываем страницу подтверждения (опционально)
+        from django.shortcuts import render
+        last_search_date = NewsDiscoveryRun.get_last_search_date()
+        today = timezone.now().date()
+        
+        context = {
+            'title': _('Поиск новостей для источника'),
+            'opts': self.model._meta,
+            'resource': resource,
+            'last_search_date': last_search_date,
+            'today': today,
+        }
+        return render(request, 'admin/discover_single_resource.html', context)
+    
     def get_discovery_status(self, request):
         """API endpoint для получения текущего статуса поиска"""
         # Аутентификация через JWT или session
@@ -554,11 +758,15 @@ class NewsResourceAdmin(TranslationAdmin):
         # Последний успешный запуск - берем last_search_date из NewsDiscoveryRun
         last_run = NewsDiscoveryRun.objects.first()
         period_start = None
-        if last_run:
-            # Преобразуем date в datetime для начала дня
-            period_start = timezone.make_aware(
-                datetime.combine(last_run.last_search_date, datetime.min.time())
-            )
+        if last_run and last_run.last_search_date:
+            try:
+                # Преобразуем date в datetime для начала дня
+                period_start = timezone.make_aware(
+                    datetime.combine(last_run.last_search_date, datetime.min.time())
+                )
+            except (AttributeError, TypeError) as e:
+                logger.warning(f"Error creating period_start from last_run: {str(e)}")
+                period_start = None
         
         # Текущая дата и время
         period_end = timezone.now()

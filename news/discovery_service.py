@@ -1,18 +1,22 @@
 """
 Сервис для автоматического поиска новостей через LLM API.
 Использует Grok 4.1 Fast (xAI) с встроенным веб-поиском как основной провайдер.
+Anthropic Claude Haiku 4.5 используется как дополнительный провайдер.
 OpenAI GPT-5.2 с Responses API используется как резервный вариант.
 """
 import logging
 import json
+import re
 from typing import List, Dict, Optional, Tuple
 from datetime import date, timedelta
+from urllib.parse import urlparse
 from django.conf import settings
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from references.models import NewsResource, NewsResourceStatistics, Manufacturer, ManufacturerStatistics
-from .models import NewsPost, NewsDiscoveryRun, NewsDiscoveryStatus
+from .models import NewsPost, NewsDiscoveryRun, NewsDiscoveryStatus, SearchConfiguration, DiscoveryAPICall
 from users.models import User
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -20,27 +24,133 @@ logger = logging.getLogger(__name__)
 class NewsDiscoveryService:
     """
     Сервис для автоматического поиска новостей через LLM API.
+    Загружает конфигурацию из БД для гибкой настройки без изменения кода.
     """
     
     SUPPORTED_LANGUAGES = ['ru', 'en', 'de', 'pt']
     
-    def __init__(self, user: Optional[User] = None):
-        self.user = user
-        self.openai_api_key = getattr(settings, 'TRANSLATION_API_KEY', '')
-        self.openai_model = getattr(settings, 'NEWS_DISCOVERY_OPENAI_MODEL', 'gpt-5.2')
-        self.grok_api_key = getattr(settings, 'XAI_API_KEY', '')
-        self.grok_model = getattr(settings, 'NEWS_DISCOVERY_GROK_MODEL', 'grok-4-1-fast')
-        self.use_grok = getattr(settings, 'NEWS_DISCOVERY_USE_GROK', True)
-        self.use_openai_fallback = getattr(settings, 'NEWS_DISCOVERY_USE_OPENAI_FALLBACK', True)
-        self.timeout = int(getattr(settings, 'NEWS_DISCOVERY_TIMEOUT', '120'))  # Таймаут в секундах
-        # Grok используется как основной провайдер, OpenAI как резервный
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        """
+        Извлекает домен из URL для использования в поиске site:
+        Примеры:
+        - https://www.ejarn.com/category/eJarn_news_index -> ejarn.com
+        - https://ejarn.com/news -> ejarn.com
+        - http://www.example.com/path -> example.com
+        """
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc or parsed.path.split('/')[0]
+            # Убираем www. если есть
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            return domain
+        except Exception:
+            # Если не удалось распарсить, пробуем извлечь вручную
+            # Убираем протокол
+            domain = re.sub(r'^https?://', '', url)
+            # Убираем путь
+            domain = domain.split('/')[0]
+            # Убираем www.
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            return domain
     
-    def discover_news_for_resource(self, resource: NewsResource) -> Tuple[int, int, Optional[str]]:
+    def __init__(self, user: Optional[User] = None, config: Optional[SearchConfiguration] = None):
+        self.user = user
+        
+        # Загружаем конфигурацию из БД или используем переданную
+        self.config = config or SearchConfiguration.get_active()
+        
+        # API ключи всегда из settings (безопасность)
+        self.openai_api_key = getattr(settings, 'TRANSLATION_API_KEY', '')
+        self.grok_api_key = getattr(settings, 'XAI_API_KEY', '')
+        self.anthropic_api_key = getattr(settings, 'ANTHROPIC_API_KEY', '')
+        self.gemini_api_key = getattr(settings, 'GEMINI_API_KEY', '')
+        
+        # Модели из конфигурации
+        self.openai_model = self.config.openai_model
+        self.grok_model = self.config.grok_model
+        self.anthropic_model = self.config.anthropic_model
+        self.gemini_model = self.config.gemini_model
+        
+        # Параметры из конфигурации
+        self.timeout = self.config.timeout
+        self.temperature = self.config.temperature
+        self.max_search_results = self.config.max_search_results
+        self.search_context_size = self.config.search_context_size
+        self.max_news_per_resource = self.config.max_news_per_resource
+        self.delay_between_requests = self.config.delay_between_requests
+        
+        # Определяем какие провайдеры использовать
+        self.primary_provider = self.config.primary_provider
+        self.fallback_chain = self.config.fallback_chain or []
+        
+        # Для совместимости со старым кодом
+        self.use_grok = self.primary_provider == 'grok' or 'grok' in self.fallback_chain
+        self.use_anthropic = self.primary_provider == 'anthropic' or 'anthropic' in self.fallback_chain
+        self.use_openai_fallback = 'openai' in self.fallback_chain
+        self.anthropic_priority = 2  # Deprecated, используем fallback_chain
+        
+        # Текущий запуск поиска (для трекинга метрик)
+        self.current_run: Optional[NewsDiscoveryRun] = None
+        self.current_resource: Optional[NewsResource] = None
+        self.current_manufacturer: Optional[Manufacturer] = None
+    
+    def start_discovery_run(self) -> NewsDiscoveryRun:
+        """Начинает новый запуск поиска с текущей конфигурацией"""
+        self.current_run = NewsDiscoveryRun.start_new_run(self.config)
+        logger.info(f"Started discovery run #{self.current_run.id} with config '{self.config.name}'")
+        return self.current_run
+    
+    def finish_discovery_run(self):
+        """Завершает текущий запуск поиска"""
+        if self.current_run:
+            self.current_run.finish()
+            logger.info(f"Finished discovery run #{self.current_run.id}: "
+                       f"{self.current_run.news_found} news, ${self.current_run.estimated_cost_usd:.4f}")
+    
+    def _track_api_call(self, provider: str, model: str, input_tokens: int, output_tokens: int,
+                        duration_ms: int, success: bool, error_message: str = '', 
+                        news_extracted: int = 0) -> float:
+        """
+        Отслеживает вызов API и рассчитывает стоимость.
+        Возвращает стоимость вызова в USD.
+        """
+        # Рассчитываем стоимость
+        input_price = self.config.get_price(provider, 'input')
+        output_price = self.config.get_price(provider, 'output')
+        cost = (input_tokens * input_price + output_tokens * output_price) / 1_000_000
+        
+        # Записываем в детальную историю
+        if self.current_run:
+            DiscoveryAPICall.objects.create(
+                discovery_run=self.current_run,
+                resource=self.current_resource,
+                manufacturer=self.current_manufacturer,
+                provider=provider,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost,
+                duration_ms=duration_ms,
+                success=success,
+                error_message=error_message,
+                news_extracted=news_extracted
+            )
+            
+            # Обновляем агрегированную статистику
+            self.current_run.add_api_call(provider, input_tokens, output_tokens, cost, success)
+        
+        return cost
+    
+    def discover_news_for_resource(self, resource: NewsResource, provider: str = 'auto') -> Tuple[int, int, Optional[str]]:
         """
         Ищет новости для одного источника.
         
         Args:
             resource: Источник новостей
+            provider: Провайдер LLM ('auto', 'grok', 'anthropic', 'openai')
             
         Returns:
             Tuple[created_count, error_count, error_message]
@@ -52,65 +162,139 @@ class NewsDiscoveryService:
         # Формируем промпт для LLM
         prompt = self._build_search_prompt(resource, last_search_date, today)
         
-        # Получаем ответ от LLM (Grok как основной, OpenAI как резервный)
+        # Извлекаем домен для ограничения веб-поиска
+        domain = self._extract_domain(resource.url)
+        
+        # Получаем ответ от LLM (с учетом выбранного провайдера)
         llm_response = None
         llm_error = None
         provider_used = None
+        errors_chain = []
         
-        # Пробуем сначала Grok, если включен
-        if self.use_grok and self.grok_api_key:
-            try:
-                logger.info(f"[Grok] Начинаю обработку ресурса {resource.id} ({resource.name})")
-                llm_response = self._query_grok(prompt)
-                provider_used = 'Grok'
-                logger.info(f"[Grok] ✅ Успешно обработал ресурс {resource.id} ({resource.name})")
-            except Exception as e:
-                logger.warning(f"[Grok] ❌ Ошибка для ресурса {resource.id}: {str(e)}")
-                llm_error = f"Grok: {str(e)}"
-                # Если есть fallback на OpenAI - пробуем его
-                if self.use_openai_fallback and self.openai_api_key:
-                    try:
-                        logger.info(f"[OpenAI Fallback] Пробую обработать ресурс {resource.id} ({resource.name})")
-                        llm_response = self._query_openai(prompt)
-                        provider_used = 'OpenAI (fallback)'
-                        logger.info(f"[OpenAI Fallback] ✅ Успешно обработал ресурс {resource.id} ({resource.name})")
-                    except Exception as e2:
-                        logger.error(f"[OpenAI Fallback] ❌ Ошибка для ресурса {resource.id}: {str(e2)}")
-                        llm_error = f"{llm_error}; OpenAI fallback: {str(e2)}"
-                        self._create_error_news(resource, f"Ошибка обоих провайдеров: {llm_error}")
-                        # Обновляем статистику при ошибке
-                        self._update_resource_statistics(
-                            resource=resource,
-                            news_count=0,
-                            error_count=1,
-                            is_no_news=False,
-                            has_errors=True
-                        )
-                        return 0, 1, f"Ошибка обоих провайдеров: {llm_error}"
-        # Если Grok не используется или нет ключа - используем OpenAI
-        elif self.openai_api_key:
-            try:
-                llm_response = self._query_openai(prompt)
-                provider_used = 'OpenAI'
-                logger.info(f"OpenAI успешно обработал ресурс {resource.id}")
-            except Exception as e:
-                logger.error(f"OpenAI error for resource {resource.id}: {str(e)}")
-                llm_error = str(e)
-                self._create_error_news(resource, f"Ошибка OpenAI: {llm_error or 'Неизвестная ошибка'}")
-                # Обновляем статистику при ошибке
-                self._update_resource_statistics(
-                    resource=resource,
-                    news_count=0,
-                    error_count=1,
-                    is_no_news=False,
-                    has_errors=True
-                )
-                return 0, 1, f"OpenAI API вернул ошибку: {llm_error}"
+        # Если provider='auto' - используем цепочку провайдеров
+        if provider == 'auto':
+            # Пробуем сначала Grok, если включен
+            if self.use_grok and self.grok_api_key:
+                try:
+                    logger.info(f"[Grok] Начинаю обработку ресурса {resource.id} ({resource.name})")
+                    llm_response = self._query_grok(prompt, domain=domain)
+                    provider_used = 'Grok'
+                    logger.info(f"[Grok] ✅ Успешно обработал ресурс {resource.id} ({resource.name})")
+                except Exception as e:
+                    logger.warning(f"[Grok] ❌ Ошибка для ресурса {resource.id}: {str(e)}")
+                    errors_chain.append(f"Grok: {str(e)}")
+                    llm_error = "; ".join(errors_chain)
+            
+            # Если Grok не сработал, пробуем Anthropic (если включен)
+            if not llm_response and self.use_anthropic and self.anthropic_api_key:
+                try:
+                    logger.info(f"[Anthropic] Пробую обработать ресурс {resource.id} ({resource.name})")
+                    llm_response = self._query_anthropic(prompt)
+                    provider_used = 'Anthropic'
+                    logger.info(f"[Anthropic] ✅ Успешно обработал ресурс {resource.id} ({resource.name})")
+                except Exception as e:
+                    logger.warning(f"[Anthropic] ❌ Ошибка для ресурса {resource.id}: {str(e)}")
+                    errors_chain.append(f"Anthropic: {str(e)}")
+                    llm_error = "; ".join(errors_chain)
+            
+            # Если Grok и Anthropic не сработали, пробуем OpenAI как резервный
+            if not llm_response and self.use_openai_fallback and self.openai_api_key:
+                try:
+                    logger.info(f"[OpenAI Fallback] Пробую обработать ресурс {resource.id} ({resource.name})")
+                    llm_response = self._query_openai(prompt)
+                    provider_used = 'OpenAI (fallback)'
+                    logger.info(f"[OpenAI Fallback] ✅ Успешно обработал ресурс {resource.id} ({resource.name})")
+                except Exception as e:
+                    logger.error(f"[OpenAI Fallback] ❌ Ошибка для ресурса {resource.id}: {str(e)}")
+                    errors_chain.append(f"OpenAI fallback: {str(e)}")
+                    llm_error = "; ".join(errors_chain)
         else:
-            error_msg = "Не настроен ни один провайдер LLM (Grok или OpenAI)"
-            logger.error(error_msg)
+            # Используем конкретный провайдер
+            if provider == 'grok':
+                if not self.grok_api_key:
+                    error_msg = "Grok API key не настроен"
+                    logger.error(f"❌ {error_msg} для ресурса {resource.id}")
+                    self._create_error_news(resource, error_msg)
+                    return 0, 1, error_msg
+                try:
+                    logger.info(f"[Grok] Начинаю обработку ресурса {resource.id} ({resource.name})")
+                    llm_response = self._query_grok(prompt, domain=domain)
+                    provider_used = 'Grok'
+                    logger.info(f"[Grok] ✅ Успешно обработал ресурс {resource.id} ({resource.name})")
+                except Exception as e:
+                    error_msg = f"Ошибка Grok: {str(e)}"
+                    logger.error(f"❌ {error_msg} для ресурса {resource.id}")
+                    self._create_error_news(resource, error_msg)
+                    self._update_resource_statistics(
+                        resource=resource,
+                        news_count=0,
+                        error_count=1,
+                        is_no_news=False,
+                        has_errors=True
+                    )
+                    return 0, 1, error_msg
+            
+            elif provider == 'anthropic':
+                if not self.anthropic_api_key:
+                    error_msg = "Anthropic API key не настроен"
+                    logger.error(f"❌ {error_msg} для ресурса {resource.id}")
+                    self._create_error_news(resource, error_msg)
+                    return 0, 1, error_msg
+                try:
+                    logger.info(f"[Anthropic] Начинаю обработку ресурса {resource.id} ({resource.name})")
+                    llm_response = self._query_anthropic(prompt)
+                    provider_used = 'Anthropic'
+                    logger.info(f"[Anthropic] ✅ Успешно обработал ресурс {resource.id} ({resource.name})")
+                except Exception as e:
+                    error_msg = f"Ошибка Anthropic: {str(e)}"
+                    logger.error(f"❌ {error_msg} для ресурса {resource.id}")
+                    self._create_error_news(resource, error_msg)
+                    self._update_resource_statistics(
+                        resource=resource,
+                        news_count=0,
+                        error_count=1,
+                        is_no_news=False,
+                        has_errors=True
+                    )
+                    return 0, 1, error_msg
+            
+            elif provider == 'openai':
+                if not self.openai_api_key:
+                    error_msg = "OpenAI API key не настроен"
+                    logger.error(f"❌ {error_msg} для ресурса {resource.id}")
+                    self._create_error_news(resource, error_msg)
+                    return 0, 1, error_msg
+                try:
+                    logger.info(f"[OpenAI] Начинаю обработку ресурса {resource.id} ({resource.name})")
+                    llm_response = self._query_openai(prompt)
+                    provider_used = 'OpenAI'
+                    logger.info(f"[OpenAI] ✅ Успешно обработал ресурс {resource.id} ({resource.name})")
+                except Exception as e:
+                    error_msg = f"Ошибка OpenAI: {str(e)}"
+                    logger.error(f"❌ {error_msg} для ресурса {resource.id}")
+                    self._create_error_news(resource, error_msg)
+                    self._update_resource_statistics(
+                        resource=resource,
+                        news_count=0,
+                        error_count=1,
+                        is_no_news=False,
+                        has_errors=True
+                    )
+                    return 0, 1, error_msg
+            else:
+                error_msg = f"Неизвестный провайдер: {provider}"
+                logger.error(f"❌ {error_msg} для ресурса {resource.id}")
+                self._create_error_news(resource, error_msg)
+                return 0, 1, error_msg
+        
+        # Если ни один провайдер не сработал
+        if not llm_response:
+            if errors_chain:
+                error_msg = f"Ошибка всех провайдеров: {llm_error}"
+            else:
+                error_msg = "Не настроен ни один провайдер LLM (Grok, Anthropic или OpenAI)"
+            logger.error(f"❌ {error_msg} для ресурса {resource.id}")
             self._create_error_news(resource, error_msg)
-            # Обновляем статистику при ошибке
             self._update_resource_statistics(
                 resource=resource,
                 news_count=0,
@@ -173,31 +357,17 @@ class NewsDiscoveryService:
         """Возвращает шаблоны промпта на указанном языке"""
         templates = {
             'ru': {
-                'main': """Используй веб-поиск для поиска новостей на сайте {url} ({name}) за период с {start_date} по {end_date} включительно.
+                'main': """Найди на сайте {url} ({name}) все новости за период с {start_date} по {end_date} включительно.
 
-КРИТИЧЕСКИ ВАЖНО:
-- Используй веб-поиск с запросом "site:{url}" с фильтрацией по дате
-- Найди все новости, статьи, публикации, пресс-релизы, опубликованные на сайте {url} за указанный период
-- Любая статья, публикация, пресс-релиз, новость, опубликованная на сайте за указанный период - это новость
-- Для каждой найденной новости найди заголовок, краткое описание (1-2 абзаца) и ссылку на источник""",
+Используй веб-поиск для поиска новостей. Ищи все статьи, публикации, пресс-релизы, новости, опубликованные на сайте за указанный период. Для каждой найденной новости найди заголовок, текст новости (1-2 абзаца) и ссылку на источник.""",
                 'period': "Период поиска: с {start_date} по {end_date} включительно.",
                 'json_format': """Верни ответ СТРОГО в формате JSON (только JSON, без дополнительного текста):
 
 {{
   "news": [
     {{
-      "title": {{
-        "ru": "Заголовок новости на русском",
-        "en": "News title in English",
-        "de": "Nachrichtentitel auf Deutsch",
-        "pt": "Título da notícia em português"
-      }},
-      "summary": {{
-        "ru": "Краткое описание новости на русском языке (1-2 абзаца)",
-        "en": "Brief news summary in English (1-2 paragraphs)",
-        "de": "Kurze Nachrichtenzusammenfassung auf Deutsch (1-2 Absätze)",
-        "pt": "Resumo breve da notícia em português (1-2 parágrafos)"
-      }},
+      "title": "Заголовок новости на русском",
+      "summary": "Текст новости на русском языке (1-2 абзаца). Пиши новость напрямую, как журналист, от третьего лица.",
       "source_url": "https://example.com/news/article"
     }}
   ]
@@ -208,13 +378,9 @@ class NewsDiscoveryService:
 Верни ТОЛЬКО JSON, без дополнительных комментариев или объяснений."""
             },
             'en': {
-                'main': """Use web search to find all news on the website {url} ({name}) for the period from {start_date} to {end_date} inclusive.
+                'main': """Find all news on the website {url} ({name}) for the period from {start_date} to {end_date} inclusive.
 
-CRITICALLY IMPORTANT:
-- Use web search with query "site:{url}" with date filtering
-- Find all news, articles, publications, press releases published on the website {url} for the specified period
-- Any article, publication, press release, news published on the website for the specified period is news
-- For each found news item, find the title, brief description (1-2 paragraphs) and source link""",
+Use web search to find news. Look for all articles, publications, press releases, news published on the website for the specified period. For each found news item, find the title, news text (1-2 paragraphs) and source link.""",
                 'period': "Search period: from {start_date} to {end_date} inclusive.",
                 'json_format': """Return the answer STRICTLY in JSON format (JSON only, without additional text):
 
@@ -222,16 +388,12 @@ CRITICALLY IMPORTANT:
   "news": [
     {{
       "title": {{
-        "ru": "Заголовок новости на русском",
         "en": "News title in English",
-        "de": "Nachrichtentitel auf Deutsch",
-        "pt": "Título da notícia em português"
+        "ru": "Заголовок новости на русском"
       }},
       "summary": {{
-        "ru": "Краткое описание новости на русском языке (1-2 абзаца)",
-        "en": "Brief news summary in English (1-2 paragraphs)",
-        "de": "Kurze Nachrichtenzusammenfassung auf Deutsch (1-2 Absätze)",
-        "pt": "Resumo breve da notícia em português (1-2 parágrafos)"
+        "en": "News text in English (1-2 paragraphs). Write the news directly, as a journalist, in third person.",
+        "ru": "Текст новости на русском языке (1-2 абзаца). Пиши новость напрямую, как журналист, от третьего лица."
       }},
       "source_url": "https://example.com/news/article"
     }}
@@ -243,13 +405,9 @@ If no news found, return: {{"news": []}}
 Return ONLY JSON, without additional comments or explanations."""
             },
             'es': {
-                'main': """Usa la búsqueda web para encontrar todas las noticias en el sitio web {url} ({name}) para el período del {start_date} al {end_date} inclusive.
+                'main': """Encuentra todas las noticias en el sitio web {url} ({name}) para el período del {start_date} al {end_date} inclusive.
 
-CRÍTICAMENTE IMPORTANTE:
-- Usa la búsqueda web con la consulta "site:{url}" con filtrado por fecha
-- Encuentra todas las noticias, artículos, publicaciones, comunicados de prensa publicados en el sitio web {url} para el período especificado
-- Cualquier artículo, publicación, comunicado de prensa, noticia publicada en el sitio web para el período especificado es noticia
-- Para cada noticia encontrada, encuentra el título, descripción breve (1-2 párrafos) y enlace a la fuente""",
+Usa la búsqueda web para encontrar noticias. Busca todos los artículos, publicaciones, comunicados de prensa, noticias publicadas en el sitio web para el período especificado. Para cada noticia encontrada, encuentra el título, texto de la noticia (1-2 párrafos) y enlace a la fuente.""",
                 'period': "Período de búsqueda: del {start_date} al {end_date} inclusive.",
                 'json_format': """Devuelve la respuesta ESTRICTAMENTE en formato JSON (solo JSON, sin texto adicional):
 
@@ -257,16 +415,12 @@ CRÍTICAMENTE IMPORTANTE:
   "news": [
     {{
       "title": {{
-        "ru": "Заголовок новости на русском",
-        "en": "News title in English",
-        "de": "Nachrichtentitel auf Deutsch",
-        "pt": "Título da notícia em português"
+        "es": "Título de la noticia en español",
+        "ru": "Заголовок новости на русском"
       }},
       "summary": {{
-        "ru": "Краткое описание новости на русском языке (1-2 абзаца)",
-        "en": "Brief news summary in English (1-2 paragraphs)",
-        "de": "Kurze Nachrichtenzusammenfassung auf Deutsch (1-2 Absätze)",
-        "pt": "Resumo breve da notícia em português (1-2 parágrafos)"
+        "es": "Texto de la noticia en español (1-2 párrafos). Escribe la noticia directamente, como periodista, en tercera persona.",
+        "ru": "Текст новости на русском языке (1-2 абзаца). Пиши новость напрямую, как журналист, от третьего лица."
       }},
       "source_url": "https://example.com/news/article"
     }}
@@ -278,13 +432,9 @@ Si no se encuentran noticias, devuelve: {{"news": []}}
 Devuelve SOLO JSON, sin comentarios adicionales o explicaciones."""
             },
             'de': {
-                'main': """Verwende die Websuche, um alle Nachrichten auf der Website {url} ({name}) für den Zeitraum vom {start_date} bis {end_date} einschließlich zu finden.
+                'main': """Finde alle Nachrichten auf der Website {url} ({name}) für den Zeitraum vom {start_date} bis {end_date} einschließlich.
 
-KRITISCH WICHTIG:
-- Verwende die Websuche mit der Abfrage "site:{url}" mit Datumsfilterung
-- Finde alle Nachrichten, Artikel, Veröffentlichungen, Pressemitteilungen, die auf der Website {url} für den angegebenen Zeitraum veröffentlicht wurden
-- Jeder Artikel, jede Veröffentlichung, Pressemitteilung, Nachricht, die auf der Website für den angegebenen Zeitraum veröffentlicht wurde, ist eine Nachricht
-- Finde für jede gefundene Nachricht den Titel, eine kurze Beschreibung (1-2 Absätze) und den Quelllink""",
+Verwende die Websuche, um Nachrichten zu finden. Suche nach allen Artikeln, Veröffentlichungen, Pressemitteilungen, Nachrichten, die auf der Website für den angegebenen Zeitraum veröffentlicht wurden. Für jede gefundene Nachricht finde den Titel, den Nachrichtentext (1-2 Absätze) und den Quelllink.""",
                 'period': "Suchzeitraum: vom {start_date} bis {end_date} einschließlich.",
                 'json_format': """Gib die Antwort STRENG im JSON-Format zurück (nur JSON, ohne zusätzlichen Text):
 
@@ -292,16 +442,12 @@ KRITISCH WICHTIG:
   "news": [
     {{
       "title": {{
-        "ru": "Заголовок новости на русском",
-        "en": "News title in English",
         "de": "Nachrichtentitel auf Deutsch",
-        "pt": "Título da notícia em português"
+        "ru": "Заголовок новости на русском"
       }},
       "summary": {{
-        "ru": "Краткое описание новости на русском языке (1-2 абзаца)",
-        "en": "Brief news summary in English (1-2 paragraphs)",
-        "de": "Kurze Nachrichtenzusammenfassung auf Deutsch (1-2 Absätze)",
-        "pt": "Resumo breve da notícia em português (1-2 parágrafos)"
+        "de": "Nachrichtentext auf Deutsch (1-2 Absätze). Schreibe die Nachricht direkt, als Journalist, in der dritten Person.",
+        "ru": "Текст новости на русском языке (1-2 абзаца). Пиши новость напрямую, как журналист, от третьего лица."
       }},
       "source_url": "https://example.com/news/article"
     }}
@@ -313,13 +459,9 @@ Wenn keine Nachrichten gefunden wurden, gib zurück: {{"news": []}}
 Gib NUR JSON zurück, ohne zusätzliche Kommentare oder Erklärungen."""
             },
             'pt': {
-                'main': """Use a pesquisa na web para encontrar todas as notícias no site {url} ({name}) para o período de {start_date} a {end_date} inclusive.
+                'main': """Encontre todas as notícias no site {url} ({name}) para o período de {start_date} a {end_date} inclusive.
 
-CRITICAMENTE IMPORTANTE:
-- Use a pesquisa na web com a consulta "site:{url}" com filtragem por data
-- Encontre todas as notícias, artigos, publicações, comunicados de imprensa publicados no site {url} para o período especificado
-- Qualquer artigo, publicação, comunicado de imprensa, notícia publicada no site para o período especificado é notícia
-- Para cada notícia encontrada, encontre o título, descrição breve (1-2 parágrafos) e link da fonte""",
+Use a pesquisa na web para encontrar notícias. Procure por todos os artigos, publicações, comunicados de imprensa, notícias publicadas no site para o período especificado. Para cada notícia encontrada, encontre o título, texto da notícia (1-2 parágrafos) e link da fonte.""",
                 'period': "Período de pesquisa: de {start_date} a {end_date} inclusive.",
                 'json_format': """Retorne a resposta ESTRITAMENTE em formato JSON (apenas JSON, sem texto adicional):
 
@@ -327,16 +469,12 @@ CRITICAMENTE IMPORTANTE:
   "news": [
     {{
       "title": {{
-        "ru": "Заголовок новости на русском",
-        "en": "News title in English",
-        "de": "Nachrichtentitel auf Deutsch",
-        "pt": "Título da notícia em português"
+        "pt": "Título da notícia em português",
+        "ru": "Заголовок новости на русском"
       }},
       "summary": {{
-        "ru": "Краткое описание новости на русском языке (1-2 абзаца)",
-        "en": "Brief news summary in English (1-2 paragraphs)",
-        "de": "Kurze Nachrichtenzusammenfassung auf Deutsch (1-2 Absätze)",
-        "pt": "Resumo breve da notícia em português (1-2 parágrafos)"
+        "pt": "Texto da notícia em português (1-2 parágrafos). Escreva a notícia diretamente, como jornalista, na terceira pessoa.",
+        "ru": "Текст новости на русском языке (1-2 абзаца). Пиши новость напрямую, как журналист, от третьего лица."
       }},
       "source_url": "https://example.com/news/article"
     }}
@@ -359,6 +497,9 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
         language = getattr(resource, 'language', 'en') or 'en'
         templates = self._get_prompt_templates(language)
         
+        # Извлекаем домен из URL для использования в поиске site:
+        domain = self._extract_domain(resource.url)
+        
         # Форматируем даты в зависимости от языка
         if language == 'ru':
             start_date_str = start_date.strftime('%d.%m.%Y')
@@ -375,8 +516,10 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
 {templates['json_format']}"""
 
         # Стандартный промпт на языке источника
+        # Используем domain для поиска site:, но оставляем полный url в описании
         return f"""{templates['main'].format(
             url=resource.url,
+            domain=domain,
             name=resource.name,
             start_date=start_date_str,
             end_date=end_date_str
@@ -384,91 +527,140 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
 {templates['json_format']}"""
 
     def _query_openai(self, prompt: str) -> Optional[Dict]:
-        """Запрос к OpenAI API с веб-поиском через Responses API"""
+        """
+        Запрос к OpenAI API с веб-поиском через Responses API.
+        Отслеживает токены и стоимость.
+        """
         if not self.openai_api_key:
             raise ValueError("OpenAI API key is not set")
+        
+        start_time = time.time()
+        input_tokens = 0
+        output_tokens = 0
         
         try:
             from openai import OpenAI
             
             client = OpenAI(api_key=self.openai_api_key)
+            result = None
             
-            # GPT-5.2 требует Responses API для веб-поиска (не Chat Completions API)
-            # Используем responses.create() с web_search_preview tool
             try:
                 # Пробуем использовать Responses API для веб-поиска
-                # Используем web_search (не web_search_preview) согласно документации
                 response = client.responses.create(
                     model=self.openai_model,
                     input=prompt,
-                    tools=[{"type": "web_search"}],  # Включаем веб-поиск через Responses API
-                    temperature=0.3,
+                    tools=[{"type": "web_search"}],
+                    temperature=self.temperature,
                 )
                 
-                # Responses API возвращает результат в output_text
+                # Извлекаем метрики токенов (если доступны)
+                if hasattr(response, 'usage'):
+                    input_tokens = getattr(response.usage, 'input_tokens', 0) or 0
+                    output_tokens = getattr(response.usage, 'output_tokens', 0) or 0
+                
                 content = response.output_text.strip()
                 logger.info("OpenAI использовал Responses API с веб-поиском")
-                logger.debug(f"OpenAI Responses API raw output: {content[:500]}")
                 
-                # Responses API может вернуть текст, а не чистый JSON
-                # Пробуем найти JSON в ответе или парсить весь текст как JSON
                 try:
-                    # Пробуем парсить как чистый JSON
-                    return json.loads(content)
+                    result = json.loads(content)
                 except json.JSONDecodeError:
-                    # Если не JSON, пробуем найти JSON блок в тексте
-                    import re
                     json_match = re.search(r'\{[^{}]*"news"[^{}]*\[.*?\]\s*\}', content, re.DOTALL)
                     if json_match:
                         try:
-                            return json.loads(json_match.group(0))
+                            result = json.loads(json_match.group(0))
                         except json.JSONDecodeError:
                             pass
                     
-                    # Если JSON не найден, но есть текст - модель не вернула JSON
-                    logger.warning(f"OpenAI Responses API вернул текст вместо JSON: {content[:200]}")
-                    # Возвращаем пустой результат, но логируем для анализа
-                    return {"news": []}
+                    if not result:
+                        logger.warning(f"OpenAI Responses API вернул текст вместо JSON: {content[:200]}")
+                        result = {"news": []}
                 
             except AttributeError:
-                # Если Responses API недоступен, пробуем Chat Completions с явным указанием веб-поиска
+                # Если Responses API недоступен
                 logger.warning("Responses API недоступен, используем Chat Completions API")
                 response = client.chat.completions.create(
                     model=self.openai_model,
                     messages=[
                         {
                             "role": "system",
-                            "content": "Ты - эксперт по поиску и суммаризации новостей. ОБЯЗАТЕЛЬНО используй веб-поиск для поиска актуальных новостей в интернете. НЕ используй свои знания - только реальные результаты из интернета. Всегда возвращай ответ в формате JSON."
+                            "content": "Ты - эксперт по поиску новостей. Возвращай ответ в формате JSON."
                         },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
+                        {"role": "user", "content": prompt}
                     ],
-                    temperature=0.3,
+                    temperature=self.temperature,
                     response_format={"type": "json_object"},
                     timeout=self.timeout
                 )
                 
+                if response.usage:
+                    input_tokens = response.usage.prompt_tokens or 0
+                    output_tokens = response.usage.completion_tokens or 0
+                
                 content = response.choices[0].message.content.strip()
-                return json.loads(content)
+                result = json.loads(content)
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"OpenAI: {input_tokens} in, {output_tokens} out, {duration_ms}ms")
+            
+            # Трекинг API вызова
+            news_count = len(result.get('news', [])) if result else 0
+            self._track_api_call(
+                provider='openai',
+                model=self.openai_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=True,
+                news_extracted=news_count
+            )
+            
+            return result
             
         except ImportError:
             raise ImportError("OpenAI library is not installed. Install it with: pip install openai")
         except json.JSONDecodeError as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            self._track_api_call(
+                provider='openai',
+                model=self.openai_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=False,
+                error_message=f"Invalid JSON: {str(e)}"
+            )
             logger.error(f"OpenAI returned invalid JSON: {str(e)}")
             raise ValueError(f"Invalid JSON response from OpenAI: {str(e)}")
         except Exception as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            self._track_api_call(
+                provider='openai',
+                model=self.openai_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=False,
+                error_message=str(e)
+            )
             logger.error(f"OpenAI API error: {str(e)}")
             raise
     
-    def _query_grok(self, prompt: str) -> Optional[Dict]:
+    def _query_grok(self, prompt: str, domain: str = None) -> Optional[Dict]:
         """
         Запрос к Grok (xAI) API с веб-поиском.
         Использует OpenAI-совместимый API xAI с инструментом web_search.
+        Отслеживает токены и стоимость.
+        
+        Args:
+            prompt: Текст промпта
+            domain: Домен для ограничения поиска (опционально)
         """
         if not self.grok_api_key:
             raise ValueError("Grok API key is not set")
+        
+        start_time = time.time()
+        input_tokens = 0
+        output_tokens = 0
         
         try:
             from openai import OpenAI
@@ -479,33 +671,38 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
                 base_url="https://api.x.ai/v1",
             )
             
-            # Добавляем промпт с явным требованием JSON формата и веб-поиска
-            json_prompt = prompt + "\n\nВАЖНО: Верни ответ ТОЛЬКО в формате JSON с полем 'news' (массив объектов). Каждый объект должен содержать поля: source_url, title (объект с ru, en, de, pt), summary (объект с ru, en, de, pt). Без markdown обертки, без ```json```."
+            # Настройки веб-поиска из конфигурации
+            web_search_config = {
+                "max_search_results": self.max_search_results,
+                "search_context_size": self.search_context_size,
+            }
+            
+            # Если передан домен, ограничиваем поиск только этим доменом
+            if domain:
+                web_search_config["allowed_domains"] = [domain]
             
             # Запрос к Grok с веб-поиском
-            # xAI требует параметр web_search_options для включения веб-поиска
-            # Пробуем использовать web_search_options в запросе
+            response = None
             try:
-                # Пробуем с web_search_options (правильный способ для xAI)
                 response = client.chat.completions.create(
                     model=self.grok_model,
                     messages=[
                         {
                             "role": "system",
-                            "content": "Ты - эксперт по поиску и суммаризации новостей. ОБЯЗАТЕЛЬНО используй веб-поиск для поиска актуальных новостей в интернете. НЕ используй свои знания - только реальные результаты из интернета. Всегда возвращай ответ в формате JSON."
+                            "content": "Используй веб-поиск для поиска новостей. Возвращай ответ в формате JSON."
                         },
                         {
                             "role": "user",
-                            "content": json_prompt
+                            "content": prompt
                         }
                     ],
-                    temperature=0.3,
+                    temperature=self.temperature,
                     response_format={"type": "json_object"},
-                    web_search_options={},  # Включаем веб-поиск
+                    web_search_options=web_search_config,
                     timeout=self.timeout
                 )
             except TypeError:
-                # Если web_search_options не поддерживается в этой версии SDK, пробуем без него
+                # Если web_search_options не поддерживается
                 logger.warning("web_search_options не поддерживается, пробуем без него")
                 try:
                     response = client.chat.completions.create(
@@ -513,138 +710,319 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
                         messages=[
                             {
                                 "role": "system",
-                                "content": "Ты - эксперт по поиску и суммаризации новостей. ОБЯЗАТЕЛЬНО используй веб-поиск для поиска актуальных новостей в интернете. НЕ используй свои знания - только реальные результаты из интернета. Всегда возвращай ответ в формате JSON."
+                                "content": "Используй веб-поиск для поиска новостей. Возвращай ответ в формате JSON."
                             },
                             {
                                 "role": "user",
-                                "content": json_prompt
+                                "content": prompt
                             }
                         ],
-                        temperature=0.3,
+                        temperature=self.temperature,
                         response_format={"type": "json_object"},
                         timeout=self.timeout
                     )
                 except Exception as e:
-                    # Если запрос с response_format не работает, пробуем без него
                     logger.warning(f"Grok request with response_format failed: {str(e)}, trying without it")
                     response = client.chat.completions.create(
                         model=self.grok_model,
                         messages=[
                             {
                                 "role": "system",
-                                "content": "Ты - эксперт по поиску и суммаризации новостей. ОБЯЗАТЕЛЬНО используй веб-поиск для поиска актуальных новостей в интернете. НЕ используй свои знания - только реальные результаты из интернета. Всегда возвращай ответ в формате JSON."
+                                "content": "Используй веб-поиск для поиска новостей. Возвращай ответ в формате JSON."
                             },
                             {
                                 "role": "user",
-                                "content": json_prompt
+                                "content": prompt
                             }
                         ],
-                        temperature=0.3,
+                        temperature=self.temperature,
                         timeout=self.timeout
                     )
             except Exception as e:
-                # Если запрос с response_format не работает, пробуем без него
                 logger.warning(f"Grok request with web_search_options failed: {str(e)}, trying without it")
                 response = client.chat.completions.create(
                     model=self.grok_model,
                     messages=[
                         {
                             "role": "system",
-                            "content": "Ты - эксперт по поиску и суммаризации новостей. ОБЯЗАТЕЛЬНО используй веб-поиск для поиска актуальных новостей в интернете. НЕ используй свои знания - только реальные результаты из интернета. Всегда возвращай ответ в формате JSON."
+                            "content": "Используй веб-поиск для поиска новостей. Возвращай ответ в формате JSON."
                         },
                         {
                             "role": "user",
-                            "content": json_prompt
+                            "content": prompt
                         }
                     ],
-                    temperature=0.3,
+                    temperature=self.temperature,
                     timeout=self.timeout
                 )
+            
+            # Извлекаем метрики токенов
+            if response and response.usage:
+                input_tokens = response.usage.prompt_tokens or 0
+                output_tokens = response.usage.completion_tokens or 0
             
             # Извлекаем контент
             content = response.choices[0].message.content.strip()
             
-            logger.info(f"Grok использовал веб-поиск для запроса")
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            logger.info(f"Grok: {input_tokens} in, {output_tokens} out, {duration_ms}ms")
             logger.info(f"Grok raw output (первые 1000 символов): {content[:1000]}")
             
-            # Логируем полный ответ для отладки
-            if len(content) > 1000:
-                logger.debug(f"Grok full output: {content}")
-            
             # Парсим JSON из ответа
+            result = None
             try:
-                # Пробуем парсить как чистый JSON
-                return json.loads(content)
+                result = json.loads(content)
             except json.JSONDecodeError:
-                # Если не JSON, пробуем найти JSON блок в тексте
-                import re
-                # Ищем JSON объект с полем "news"
+                # Ищем JSON блок в тексте
                 json_match = re.search(r'\{[^{}]*"news"[^{}]*\[.*?\]\s*\}', content, re.DOTALL)
                 if json_match:
                     try:
-                        return json.loads(json_match.group(0))
+                        result = json.loads(json_match.group(0))
                     except json.JSONDecodeError:
                         pass
                 
                 # Пробуем найти JSON в markdown блоке
-                json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
-                if json_match:
-                    try:
-                        return json.loads(json_match.group(1))
-                    except json.JSONDecodeError:
-                        pass
+                if not result:
+                    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+                    if json_match:
+                        try:
+                            result = json.loads(json_match.group(1))
+                        except json.JSONDecodeError:
+                            pass
                 
-                # Если JSON не найден, но есть текст - модель не вернула JSON
-                logger.warning(f"Grok вернул текст вместо JSON: {content[:200]}")
-                # Возвращаем пустой результат, но логируем для анализа
-                return {"news": []}
+                if not result:
+                    logger.warning(f"Grok вернул текст вместо JSON: {content[:200]}")
+                    result = {"news": []}
+            
+            # Трекинг API вызова
+            news_count = len(result.get('news', [])) if result else 0
+            self._track_api_call(
+                provider='grok',
+                model=self.grok_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=True,
+                news_extracted=news_count
+            )
+            
+            return result
             
         except ImportError:
             raise ImportError("OpenAI library is not installed. Install it with: pip install openai")
         except json.JSONDecodeError as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            self._track_api_call(
+                provider='grok',
+                model=self.grok_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=False,
+                error_message=f"Invalid JSON: {str(e)}"
+            )
             logger.error(f"Grok returned invalid JSON: {str(e)}")
             raise ValueError(f"Invalid JSON response from Grok: {str(e)}")
         except Exception as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            self._track_api_call(
+                provider='grok',
+                model=self.grok_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=False,
+                error_message=str(e)
+            )
             logger.error(f"Grok API error: {str(e)}")
             raise
     
+    def _query_anthropic(self, prompt: str) -> Optional[Dict]:
+        """
+        Запрос к Anthropic (Claude) API с веб-поиском.
+        Использует Claude Haiku 4.5 с инструментом web_search.
+        Отслеживает токены и стоимость.
+        """
+        if not self.anthropic_api_key:
+            raise ValueError("Anthropic API key is not set")
+        
+        start_time = time.time()
+        input_tokens = 0
+        output_tokens = 0
+        
+        try:
+            from anthropic import Anthropic
+            
+            client = Anthropic(api_key=self.anthropic_api_key)
+            
+            # Извлекаем домен из промпта для ограничения поиска
+            url_match = re.search(r'https?://([^/\s]+)', prompt)
+            domain = None
+            if url_match:
+                domain = url_match.group(1).replace('www.', '')
+            
+            # Формируем промпт для Anthropic
+            if domain:
+                anthropic_prompt = f"""Используй веб-поиск для поиска новостей на сайте {domain}.
+
+{prompt}
+
+ФОРМАТ ОТВЕТА:
+Верни ответ ТОЛЬКО в формате JSON, БЕЗ объяснений.
+Формат: {{"news": [{{"source_url": "...", "title": {{"ru": "...", "en": "..."}}, "summary": {{"ru": "...", "en": "..."}}}}, ...]}}"""
+            else:
+                anthropic_prompt = prompt
+            
+            # Параметры для веб-поиска
+            web_search_tool = {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": self.max_search_results,
+            }
+            
+            if domain:
+                web_search_tool["allowed_domains"] = [domain]
+            
+            system_message = "Ты - помощник для поиска новостей. Верни результат ТОЛЬКО в формате JSON."
+            
+            response = client.messages.create(
+                model=self.anthropic_model,
+                max_tokens=6144,
+                system=system_message,
+                messages=[{"role": "user", "content": anthropic_prompt}],
+                tools=[web_search_tool],
+                temperature=self.temperature,
+                timeout=self.timeout
+            )
+            
+            # Извлекаем метрики токенов
+            if hasattr(response, 'usage'):
+                input_tokens = getattr(response.usage, 'input_tokens', 0) or 0
+                output_tokens = getattr(response.usage, 'output_tokens', 0) or 0
+            
+            # Извлекаем контент
+            content = ""
+            for block in response.content:
+                if block.type == "text":
+                    content += block.text
+            content = content.strip()
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"Anthropic: {input_tokens} in, {output_tokens} out, {duration_ms}ms")
+            
+            # Парсим JSON
+            result = None
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                # Ищем JSON в markdown блоке
+                json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+                if json_match:
+                    try:
+                        result = json.loads(json_match.group(1).strip())
+                    except json.JSONDecodeError:
+                        pass
+                
+                if not result:
+                    json_match = re.search(r'\{\s*"news"\s*:\s*\[.*?\]\s*\}', content, re.DOTALL)
+                    if json_match:
+                        try:
+                            result = json.loads(json_match.group(0))
+                        except json.JSONDecodeError:
+                            pass
+                
+                if not result:
+                    # Рекурсивный поиск
+                    brace_count = 0
+                    start_idx = -1
+                    for i, char in enumerate(content):
+                        if char == '{':
+                            if start_idx == -1:
+                                start_idx = i
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0 and start_idx != -1:
+                                try:
+                                    parsed = json.loads(content[start_idx:i+1])
+                                    if 'news' in parsed:
+                                        result = parsed
+                                        break
+                                except json.JSONDecodeError:
+                                    pass
+                                start_idx = -1
+                
+                if not result:
+                    logger.warning(f"Anthropic вернул текст вместо JSON: {content[:500]}")
+                    result = {"news": []}
+            
+            # Трекинг API вызова
+            news_count = len(result.get('news', [])) if result else 0
+            self._track_api_call(
+                provider='anthropic',
+                model=self.anthropic_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=True,
+                news_extracted=news_count
+            )
+            
+            return result
+            
+        except ImportError:
+            raise ImportError("Anthropic library is not installed. Install it with: pip install anthropic")
+        except Exception as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            self._track_api_call(
+                provider='anthropic',
+                model=self.anthropic_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=False,
+                error_message=str(e)
+            )
+            logger.error(f"Anthropic API error: {str(e)}")
+            raise
+    
     def _query_gemini(self, prompt: str) -> Optional[Dict]:
-        """Запрос к Google Gemini API"""
+        """
+        Запрос к Google Gemini API.
+        Отслеживает токены и стоимость.
+        """
         if not self.gemini_api_key:
             raise ValueError("Gemini API key is not set")
+        
+        start_time = time.time()
+        input_tokens = 0
+        output_tokens = 0
         
         try:
             import google.generativeai as genai
             
             genai.configure(api_key=self.gemini_api_key)
             
-            # Gemini 3 Pro поддерживает веб-поиск через google_search tool
-            # ВАЖНО: Gemini-3-pro не доступна на бесплатном тарифе (limit: 0)
-            # Для бесплатного тарифа используйте gemini-2.5-flash
             try:
-                # Пробуем использовать google_search tool
-                # Для старого пакета google.generativeai синтаксис может отличаться
                 model = genai.GenerativeModel(self.gemini_model)
-                # Примечание: веб-поиск может быть недоступен в старом пакете
-                # Для полной поддержки нужно использовать новый пакет google.genai
                 logger.info(f"Using Gemini model {self.gemini_model}")
             except Exception as e:
                 logger.warning(f"Error initializing Gemini model {self.gemini_model}: {str(e)}")
                 raise
             
-            # Gemini требует специальный формат для JSON
-            # Добавляем требование использовать веб-поиск в промпт
-            json_prompt = prompt + "\n\nВАЖНО: ОБЯЗАТЕЛЬНО используй веб-поиск для поиска новостей. НЕ используй свои знания - только реальные результаты из интернета. Верни ответ ТОЛЬКО в формате JSON, без markdown форматирования, без ```json``` обертки."
-            
-            # Для Gemini API библиотека сама управляет таймаутами
-            # Используем стандартный вызов - библиотека имеет встроенные таймауты
             response = model.generate_content(
-                json_prompt,
+                prompt,
                 generation_config={
-                    "temperature": 0.3,
+                    "temperature": self.temperature,
                     "response_mime_type": "application/json",
                 }
             )
+            
+            # Извлекаем метрики токенов (если доступны)
+            if hasattr(response, 'usage_metadata'):
+                input_tokens = getattr(response.usage_metadata, 'prompt_token_count', 0) or 0
+                output_tokens = getattr(response.usage_metadata, 'candidates_token_count', 0) or 0
             
             content = response.text.strip()
             # Убираем возможные markdown обертки
@@ -656,14 +1034,51 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
                 content = content[:-3]
             content = content.strip()
             
-            return json.loads(content)
+            result = json.loads(content)
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"Gemini: {input_tokens} in, {output_tokens} out, {duration_ms}ms")
+            
+            # Трекинг API вызова
+            news_count = len(result.get('news', [])) if result else 0
+            self._track_api_call(
+                provider='gemini',
+                model=self.gemini_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=True,
+                news_extracted=news_count
+            )
+            
+            return result
             
         except ImportError:
             raise ImportError("Google Generative AI library is not installed. Install it with: pip install google-generativeai")
         except json.JSONDecodeError as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            self._track_api_call(
+                provider='gemini',
+                model=self.gemini_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=False,
+                error_message=f"Invalid JSON: {str(e)}"
+            )
             logger.error(f"Gemini returned invalid JSON: {str(e)}")
             raise ValueError(f"Invalid JSON response from Gemini: {str(e)}")
         except Exception as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            self._track_api_call(
+                provider='gemini',
+                model=self.gemini_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=duration_ms,
+                success=False,
+                error_message=str(e)
+            )
             logger.error(f"Gemini API error: {str(e)}")
             raise
     
@@ -676,25 +1091,31 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
         summary_data = news_item.get('summary', {})
         source_url = news_item.get('source_url', '')
         
-        # Используем русский язык как основной
-        title_ru = title_data.get('ru', 'Без заголовка')
-        summary_ru = summary_data.get('ru', '')
+        # Определяем язык источника
+        source_language = getattr(resource, 'language', 'en') or 'en'
         
-        # Формируем body в Markdown формате с ссылкой на источник в начале
-        # Добавляем ссылку на источник для удобства проверки администратором
+        # Обрабатываем разные форматы ответа:
+        # - Для русских источников: title/summary — строки
+        # - Для остальных: title/summary — объекты с языками
+        if isinstance(title_data, str):
+            # Русский источник — title/summary уже строки
+            title_ru = title_data or 'Без заголовка'
+            summary_ru = summary_data if isinstance(summary_data, str) else ''
+            title_source = title_ru
+            summary_source = summary_ru
+        else:
+            # Не-русский источник — извлекаем оба языка
+            title_ru = title_data.get('ru', 'Без заголовка')
+            summary_ru = summary_data.get('ru', '') if isinstance(summary_data, dict) else ''
+            title_source = title_data.get(source_language, title_ru)
+            summary_source = summary_data.get(source_language, summary_ru) if isinstance(summary_data, dict) else summary_ru
+        
         # Если source_url из LLM пустой, используем URL ресурса
         if not source_url and resource:
             source_url = resource.url
         
-        if source_url:
-            resource_name = resource.name if resource else 'Источник'
-            body_ru = f"**Источник для проверки:** [{resource_name}]({source_url})\n\n{summary_ru}"
-        else:
-            body_ru = summary_ru
-        
-        # Убеждаемся, что source_url всегда заполнен (используем URL ресурса если из LLM пустой)
-        if not source_url and resource:
-            source_url = resource.url
+        # Используем summary напрямую без дополнительной информации об источнике
+        body_ru = summary_ru
         
         # Создаем новость
         news_post = NewsPost.objects.create(
@@ -702,24 +1123,16 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
             body=body_ru,
             source_url=source_url or '',  # Всегда сохраняем URL источника
             status='draft',
-            source_language='ru',
+            source_language=source_language,
             author=self.user,
             pub_date=timezone.now()
         )
         
-        # Если есть переводы - сохраняем их через modeltranslation
-        # (modeltranslation автоматически создаст поля title_en, title_de, title_pt и т.д.)
-        for lang in self.SUPPORTED_LANGUAGES:
-            if lang == 'ru':
-                continue
-            
-            title_lang = title_data.get(lang, '')
-            summary_lang = summary_data.get(lang, '')
-            
-            if title_lang:
-                setattr(news_post, f'title_{lang}', title_lang)
-            if summary_lang:
-                setattr(news_post, f'body_{lang}', summary_lang)
+        # Сохраняем оригинальный язык источника если он отличается от русского
+        if source_language != 'ru' and title_source:
+            setattr(news_post, f'title_{source_language}', title_source)
+        if source_language != 'ru' and summary_source:
+            setattr(news_post, f'body_{source_language}', summary_source)
         
         news_post.save()
         logger.info(f"Created news post: {news_post.id} - {title_ru}")
@@ -731,11 +1144,10 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
         title_de = f"Keine Nachrichten von Quelle '{resource.name}' gefunden"
         title_pt = f"Nenhuma notícia encontrada da fonte '{resource.name}'"
         
-        # Добавляем ссылку на источник в начало текста для удобства проверки
-        body_ru = f"**Источник для проверки:** [{resource.name}]({resource.url})\n\nЗа период с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')} на ресурсе [{resource.name}]({resource.url}) новостей не обнаружено."
-        body_en = f"**Source for verification:** [{resource.name}]({resource.url})\n\nFor the period from {start_date.strftime('%d.%m.%Y')} to {end_date.strftime('%d.%m.%Y')}, no news was found on the resource [{resource.name}]({resource.url})."
-        body_de = f"**Quelle zur Überprüfung:** [{resource.name}]({resource.url})\n\nFür den Zeitraum vom {start_date.strftime('%d.%m.%Y')} bis {end_date.strftime('%d.%m.%Y')} wurden auf der Ressource [{resource.name}]({resource.url}) keine Nachrichten gefunden."
-        body_pt = f"**Fonte para verificação:** [{resource.name}]({resource.url})\n\nNo período de {start_date.strftime('%d.%m.%Y')} a {end_date.strftime('%d.%m.%Y')}, nenhuma notícia foi encontrada no recurso [{resource.name}]({resource.url})."
+        body_ru = f"За период с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')} на ресурсе [{resource.name}]({resource.url}) новостей не обнаружено."
+        body_en = f"For the period from {start_date.strftime('%d.%m.%Y')} to {end_date.strftime('%d.%m.%Y')}, no news was found on the resource [{resource.name}]({resource.url})."
+        body_de = f"Für den Zeitraum vom {start_date.strftime('%d.%m.%Y')} bis {end_date.strftime('%d.%m.%Y')} wurden auf der Ressource [{resource.name}]({resource.url}) keine Nachrichten gefunden."
+        body_pt = f"No período de {start_date.strftime('%d.%m.%Y')} a {end_date.strftime('%d.%m.%Y')}, nenhuma notícia foi encontrada no recurso [{resource.name}]({resource.url})."
         
         news_post = NewsPost.objects.create(
             title=title_ru,
@@ -763,11 +1175,10 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
         title_de = f"Fehler bei der Suche nach Nachrichten von Quelle '{resource.name}'"
         title_pt = f"Erro ao buscar notícias da fonte '{resource.name}'"
         
-        # Добавляем ссылку на источник в начало текста для удобства проверки
-        body_ru = f"**Источник для проверки:** [{resource.name}]({resource.url})\n\nПри попытке получить новости с ресурса [{resource.name}]({resource.url}) произошла ошибка:\n\n{error_message}"
-        body_en = f"**Source for verification:** [{resource.name}]({resource.url})\n\nAn error occurred while trying to get news from resource [{resource.name}]({resource.url}):\n\n{error_message}"
-        body_de = f"**Quelle zur Überprüfung:** [{resource.name}]({resource.url})\n\nBeim Versuch, Nachrichten von der Ressource [{resource.name}]({resource.url}) zu erhalten, ist ein Fehler aufgetreten:\n\n{error_message}"
-        body_pt = f"**Fonte para verificação:** [{resource.name}]({resource.url})\n\nOcorreu um erro ao tentar obter notícias do recurso [{resource.name}]({resource.url}):\n\n{error_message}"
+        body_ru = f"При попытке получить новости с ресурса [{resource.name}]({resource.url}) произошла ошибка:\n\n{error_message}"
+        body_en = f"An error occurred while trying to get news from resource [{resource.name}]({resource.url}):\n\n{error_message}"
+        body_de = f"Beim Versuch, Nachrichten von der Ressource [{resource.name}]({resource.url}) zu erhalten, ist ein Fehler aufgetreten:\n\n{error_message}"
+        body_pt = f"Ocorreu um erro ao tentar obter notícias do recurso [{resource.name}]({resource.url}):\n\n{error_message}"
         
         news_post = NewsPost.objects.create(
             title=title_ru,
@@ -945,7 +1356,9 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
                     status_obj.save()
                 
                 try:
-                    created, errors, error_msg = self.discover_news_for_resource(resource)
+                    # Используем провайдер из status_obj, если указан, иначе 'auto'
+                    provider = status_obj.provider if status_obj else 'auto'
+                    created, errors, error_msg = self.discover_news_for_resource(resource, provider=provider)
                     total_created += created
                     total_errors += errors
                     
@@ -984,12 +1397,13 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
     
     # ==================== МЕТОДЫ ДЛЯ ПОИСКА ПО ПРОИЗВОДИТЕЛЯМ ====================
     
-    def discover_news_for_manufacturer(self, manufacturer: Manufacturer) -> Tuple[int, int, Optional[str]]:
+    def discover_news_for_manufacturer(self, manufacturer: Manufacturer, provider: str = 'auto') -> Tuple[int, int, Optional[str]]:
         """
         Ищет новости о производителе в интернете.
         
         Args:
             manufacturer: Производитель
+            provider: Провайдер LLM ('auto', 'grok', 'anthropic', 'openai')
             
         Returns:
             Tuple[created_count, error_count, error_message]
@@ -1001,65 +1415,136 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
         # Формируем промпт для LLM
         prompt = self._build_manufacturer_search_prompt(manufacturer, last_search_date, today)
         
-        # Получаем ответ от LLM (Grok как основной, OpenAI как резервный)
+        # Получаем ответ от LLM (с учетом выбранного провайдера)
         llm_response = None
         llm_error = None
         provider_used = None
+        errors_chain = []
         
-        # Пробуем сначала Grok, если включен
-        if self.use_grok and self.grok_api_key:
-            try:
-                logger.info(f"[Grok] Начинаю обработку производителя {manufacturer.id} ({manufacturer.name})")
-                llm_response = self._query_grok(prompt)
-                provider_used = 'Grok'
-                logger.info(f"[Grok] ✅ Успешно обработал производителя {manufacturer.id} ({manufacturer.name})")
-            except Exception as e:
-                logger.warning(f"[Grok] ❌ Ошибка для производителя {manufacturer.id}: {str(e)}")
-                llm_error = f"Grok: {str(e)}"
-                # Если есть fallback на OpenAI - пробуем его
-                if self.use_openai_fallback and self.openai_api_key:
-                    try:
-                        logger.info(f"[OpenAI Fallback] Пробую обработать производителя {manufacturer.id} ({manufacturer.name})")
-                        llm_response = self._query_openai(prompt)
-                        provider_used = 'OpenAI (fallback)'
-                        logger.info(f"[OpenAI Fallback] ✅ Успешно обработал производителя {manufacturer.id} ({manufacturer.name})")
-                    except Exception as e2:
-                        logger.error(f"[OpenAI Fallback] ❌ Ошибка для производителя {manufacturer.id}: {str(e2)}")
-                        llm_error = f"{llm_error}; OpenAI fallback: {str(e2)}"
-                        self._create_error_manufacturer(manufacturer, f"Ошибка обоих провайдеров: {llm_error}")
-                        # Обновляем статистику при ошибке
-                        self._update_manufacturer_statistics(
-                            manufacturer=manufacturer,
-                            news_count=0,
-                            error_count=1,
-                            is_no_news=False,
-                            has_errors=True
-                        )
-                        return 0, 1, f"Ошибка обоих провайдеров: {llm_error}"
-        # Если Grok не используется или нет ключа - используем OpenAI
-        elif self.openai_api_key:
-            try:
-                llm_response = self._query_openai(prompt)
-                provider_used = 'OpenAI'
-                logger.info(f"OpenAI успешно обработал производителя {manufacturer.id}")
-            except Exception as e:
-                logger.error(f"OpenAI error for manufacturer {manufacturer.id}: {str(e)}")
-                llm_error = str(e)
-                self._create_error_manufacturer(manufacturer, f"Ошибка OpenAI: {llm_error or 'Неизвестная ошибка'}")
-                # Обновляем статистику при ошибке
-                self._update_manufacturer_statistics(
-                    manufacturer=manufacturer,
-                    news_count=0,
-                    error_count=1,
-                    is_no_news=False,
-                    has_errors=True
-                )
-                return 0, 1, f"OpenAI API вернул ошибку: {llm_error}"
+        # Если provider='auto' - используем цепочку провайдеров
+        if provider == 'auto':
+            # Пробуем сначала Grok, если включен
+            if self.use_grok and self.grok_api_key:
+                try:
+                    logger.info(f"[Grok] Начинаю обработку производителя {manufacturer.id} ({manufacturer.name})")
+                    llm_response = self._query_grok(prompt)
+                    provider_used = 'Grok'
+                    logger.info(f"[Grok] ✅ Успешно обработал производителя {manufacturer.id} ({manufacturer.name})")
+                except Exception as e:
+                    logger.warning(f"[Grok] ❌ Ошибка для производителя {manufacturer.id}: {str(e)}")
+                    errors_chain.append(f"Grok: {str(e)}")
+                    llm_error = "; ".join(errors_chain)
+            
+            # Если Grok не сработал, пробуем Anthropic (если включен)
+            if not llm_response and self.use_anthropic and self.anthropic_api_key:
+                try:
+                    logger.info(f"[Anthropic] Пробую обработать производителя {manufacturer.id} ({manufacturer.name})")
+                    llm_response = self._query_anthropic(prompt)
+                    provider_used = 'Anthropic'
+                    logger.info(f"[Anthropic] ✅ Успешно обработал производителя {manufacturer.id} ({manufacturer.name})")
+                except Exception as e:
+                    logger.warning(f"[Anthropic] ❌ Ошибка для производителя {manufacturer.id}: {str(e)}")
+                    errors_chain.append(f"Anthropic: {str(e)}")
+                    llm_error = "; ".join(errors_chain)
+            
+            # Если Grok и Anthropic не сработали, пробуем OpenAI как резервный
+            if not llm_response and self.use_openai_fallback and self.openai_api_key:
+                try:
+                    logger.info(f"[OpenAI Fallback] Пробую обработать производителя {manufacturer.id} ({manufacturer.name})")
+                    llm_response = self._query_openai(prompt)
+                    provider_used = 'OpenAI (fallback)'
+                    logger.info(f"[OpenAI Fallback] ✅ Успешно обработал производителя {manufacturer.id} ({manufacturer.name})")
+                except Exception as e:
+                    logger.error(f"[OpenAI Fallback] ❌ Ошибка для производителя {manufacturer.id}: {str(e)}")
+                    errors_chain.append(f"OpenAI fallback: {str(e)}")
+                    llm_error = "; ".join(errors_chain)
         else:
-            error_msg = "Не настроен ни один провайдер LLM (Grok или OpenAI)"
-            logger.error(error_msg)
+            # Используем конкретный провайдер (копируем логику из discover_news_for_resource)
+            if provider == 'grok':
+                if not self.grok_api_key:
+                    error_msg = "Grok API key не настроен"
+                    logger.error(f"❌ {error_msg} для производителя {manufacturer.id}")
+                    self._create_error_manufacturer(manufacturer, error_msg)
+                    return 0, 1, error_msg
+                try:
+                    logger.info(f"[Grok] Начинаю обработку производителя {manufacturer.id} ({manufacturer.name})")
+                    llm_response = self._query_grok(prompt)
+                    provider_used = 'Grok'
+                    logger.info(f"[Grok] ✅ Успешно обработал производителя {manufacturer.id} ({manufacturer.name})")
+                except Exception as e:
+                    error_msg = f"Ошибка Grok: {str(e)}"
+                    logger.error(f"❌ {error_msg} для производителя {manufacturer.id}")
+                    self._create_error_manufacturer(manufacturer, error_msg)
+                    self._update_manufacturer_statistics(
+                        manufacturer=manufacturer,
+                        news_count=0,
+                        error_count=1,
+                        is_no_news=False,
+                        has_errors=True
+                    )
+                    return 0, 1, error_msg
+            
+            elif provider == 'anthropic':
+                if not self.anthropic_api_key:
+                    error_msg = "Anthropic API key не настроен"
+                    logger.error(f"❌ {error_msg} для производителя {manufacturer.id}")
+                    self._create_error_manufacturer(manufacturer, error_msg)
+                    return 0, 1, error_msg
+                try:
+                    logger.info(f"[Anthropic] Начинаю обработку производителя {manufacturer.id} ({manufacturer.name})")
+                    llm_response = self._query_anthropic(prompt)
+                    provider_used = 'Anthropic'
+                    logger.info(f"[Anthropic] ✅ Успешно обработал производителя {manufacturer.id} ({manufacturer.name})")
+                except Exception as e:
+                    error_msg = f"Ошибка Anthropic: {str(e)}"
+                    logger.error(f"❌ {error_msg} для производителя {manufacturer.id}")
+                    self._create_error_manufacturer(manufacturer, error_msg)
+                    self._update_manufacturer_statistics(
+                        manufacturer=manufacturer,
+                        news_count=0,
+                        error_count=1,
+                        is_no_news=False,
+                        has_errors=True
+                    )
+                    return 0, 1, error_msg
+            
+            elif provider == 'openai':
+                if not self.openai_api_key:
+                    error_msg = "OpenAI API key не настроен"
+                    logger.error(f"❌ {error_msg} для производителя {manufacturer.id}")
+                    self._create_error_manufacturer(manufacturer, error_msg)
+                    return 0, 1, error_msg
+                try:
+                    logger.info(f"[OpenAI] Начинаю обработку производителя {manufacturer.id} ({manufacturer.name})")
+                    llm_response = self._query_openai(prompt)
+                    provider_used = 'OpenAI'
+                    logger.info(f"[OpenAI] ✅ Успешно обработал производителя {manufacturer.id} ({manufacturer.name})")
+                except Exception as e:
+                    error_msg = f"Ошибка OpenAI: {str(e)}"
+                    logger.error(f"❌ {error_msg} для производителя {manufacturer.id}")
+                    self._create_error_manufacturer(manufacturer, error_msg)
+                    self._update_manufacturer_statistics(
+                        manufacturer=manufacturer,
+                        news_count=0,
+                        error_count=1,
+                        is_no_news=False,
+                        has_errors=True
+                    )
+                    return 0, 1, error_msg
+            else:
+                error_msg = f"Неизвестный провайдер: {provider}"
+                logger.error(f"❌ {error_msg} для производителя {manufacturer.id}")
+                self._create_error_manufacturer(manufacturer, error_msg)
+                return 0, 1, error_msg
+        
+        # Если ни один провайдер не сработал
+        if not llm_response:
+            if errors_chain:
+                error_msg = f"Ошибка всех провайдеров: {llm_error}"
+            else:
+                error_msg = "Не настроен ни один провайдер LLM (Grok, Anthropic или OpenAI)"
+            logger.error(f"❌ {error_msg} для производителя {manufacturer.id}")
             self._create_error_manufacturer(manufacturer, error_msg)
-            # Обновляем статистику при ошибке
             self._update_manufacturer_statistics(
                 manufacturer=manufacturer,
                 news_count=0,
@@ -1135,16 +1620,10 @@ Retorne APENAS JSON, sem comentários adicionais ou explicações."""
             start_date_str = start_date.strftime('%Y-%m-%d')
             end_date_str = end_date.strftime('%Y-%m-%d')
             
-            return f"""Use web search to find news about manufacturer {manufacturer.name} for the period from {start_date_str} to {end_date_str} inclusive.
+            return f"""Find all news about manufacturer {manufacturer.name} for the period from {start_date_str} to {end_date_str} inclusive.
 
-CRITICALLY IMPORTANT:
-- Manufacturer {manufacturer.name} has no official websites specified
-- Search for news about manufacturer {manufacturer.name} on the internet
-- Use web search with query "{manufacturer.name}" HVAC news with date filtering
-- Find all news, articles, publications, press releases about the manufacturer published for the specified period
-- Any article, publication, press release, news about the manufacturer published for the specified period is news
-- For each found news item, find the title, brief description (1-2 paragraphs) and source link
-- News can be on any websites: industry publications, news portals, press releases, etc.
+Use web search to find news. Look for all articles, publications, press releases, news about the manufacturer published on industry publications, news portals, press releases, or other sources for the specified period. For each found news item, find the title, news text (1-2 paragraphs) and source link.
+
 {templates['json_format']}"""
         
         websites_str = ", ".join(websites)
@@ -1152,14 +1631,16 @@ CRITICALLY IMPORTANT:
         start_date_str = start_date.strftime('%Y-%m-%d')
         end_date_str = end_date.strftime('%Y-%m-%d')
         
-        return f"""Use web search to find news on the official websites of manufacturer {manufacturer.name} for the period from {start_date_str} to {end_date_str} inclusive.
+        # Извлекаем домены из URL для использования в поиске site:
+        domains = [self._extract_domain(url) for url in websites]
+        domains_str = ", ".join([f"site:{domain}" for domain in domains])
+        
+        return f"""Find all news about manufacturer {manufacturer.name} for the period from {start_date_str} to {end_date_str} inclusive.
 
-CRITICALLY IMPORTANT:
-- Official manufacturer websites: {websites_str}
-- For each website, use web search with query "site:[URL]" with date filtering
-- Find all news, articles, publications, press releases published on these websites for the specified period
-- Any article, publication, press release, news published on the official manufacturer websites for the specified period is news
-- For each found news item, find the title, brief description (1-2 paragraphs) and source link
+Official manufacturer websites: {websites_str}
+
+Use web search to find news. Look for all articles, publications, press releases, news about the manufacturer published on these websites or other industry sources for the specified period. For each found news item, find the title, news text (1-2 paragraphs) and source link.
+
 {templates['json_format']}"""
     
     def _create_manufacturer_news_post(self, news_item: Dict, manufacturer: Manufacturer):
@@ -1169,17 +1650,27 @@ CRITICALLY IMPORTANT:
         summary_data = news_item.get('summary', {})
         source_url = news_item.get('source_url', '')
         
-        # Используем русский язык как основной
-        title_ru = title_data.get('ru', 'Без заголовка')
-        summary_ru = summary_data.get('ru', '')
+        # Для производителей всегда используем английский как язык источника
+        source_language = 'en'
         
-        # Формируем body в Markdown формате с ссылкой на источник в начале
+        # Обрабатываем разные форматы ответа
+        if isinstance(title_data, str):
+            title_ru = title_data or 'Без заголовка'
+            summary_ru = summary_data if isinstance(summary_data, str) else ''
+            title_en = title_ru
+            summary_en = summary_ru
+        else:
+            title_ru = title_data.get('ru', 'Без заголовка')
+            summary_ru = summary_data.get('ru', '') if isinstance(summary_data, dict) else ''
+            title_en = title_data.get('en', title_ru)
+            summary_en = summary_data.get('en', summary_ru) if isinstance(summary_data, dict) else summary_ru
+        
         if not source_url:
             # Если source_url пустой, используем первый сайт производителя
             source_url = manufacturer.website_1 or ''
         
-        body_ru = f"**Источник для проверки:** [{source_url}]({source_url})\n\n" if source_url else ""
-        body_ru += summary_ru
+        # Используем summary напрямую без дополнительной информации об источнике
+        body_ru = summary_ru
         
         # Создаем новость
         news_post = NewsPost.objects.create(
@@ -1188,22 +1679,16 @@ CRITICALLY IMPORTANT:
             source_url=source_url,
             manufacturer=manufacturer,  # Связываем с производителем
             status='draft',
-            source_language='ru',
+            source_language=source_language,
             author=self.user,
             pub_date=timezone.now()
         )
         
-        # Устанавливаем переводы
-        for lang in ['en', 'de', 'pt']:
-            title_lang = title_data.get(lang, '')
-            summary_lang = summary_data.get(lang, '')
-            
-            if title_lang:
-                setattr(news_post, f'title_{lang}', title_lang)
-            if summary_lang:
-                body_lang = f"**Source for verification:** [{source_url}]({source_url})\n\n" if source_url else ""
-                body_lang += summary_lang
-                setattr(news_post, f'body_{lang}', body_lang)
+        # Сохраняем английскую версию
+        if title_en:
+            setattr(news_post, 'title_en', title_en)
+        if summary_en:
+            setattr(news_post, 'body_en', summary_en)
         
         news_post.save()
         logger.info(f"Created news post for manufacturer {manufacturer.id}: {news_post.id} - {title_ru}")
@@ -1215,33 +1700,12 @@ CRITICALLY IMPORTANT:
         title_de = f"Keine Nachrichten über Hersteller '{manufacturer.name}' gefunden"
         title_pt = f"Nenhuma notícia encontrada sobre o fabricante '{manufacturer.name}'"
         
-        # Собираем сайты производителя
-        websites = []
-        if manufacturer.website_1:
-            websites.append(manufacturer.website_1)
-        if manufacturer.website_2:
-            websites.append(manufacturer.website_2)
-        if manufacturer.website_3:
-            websites.append(manufacturer.website_3)
-        
-        websites_str = ", ".join([f"[{url}]({url})" for url in websites]) if websites else "нет указанных сайтов"
         source_url = manufacturer.website_1 or ''
         
-        body_ru = f"**Производитель для проверки:** {manufacturer.name}\n"
-        body_ru += f"**Сайты производителя:** {websites_str}\n\n"
-        body_ru += f"За период с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')} новостей о производителе {manufacturer.name} не обнаружено."
-        
-        body_en = f"**Manufacturer for verification:** {manufacturer.name}\n"
-        body_en += f"**Manufacturer websites:** {websites_str}\n\n"
-        body_en += f"For the period from {start_date.strftime('%d.%m.%Y')} to {end_date.strftime('%d.%m.%Y')}, no news was found about manufacturer {manufacturer.name}."
-        
-        body_de = f"**Hersteller zur Überprüfung:** {manufacturer.name}\n"
-        body_de += f"**Hersteller-Websites:** {websites_str}\n\n"
-        body_de += f"Für den Zeitraum vom {start_date.strftime('%d.%m.%Y')} bis {end_date.strftime('%d.%m.%Y')} wurden keine Nachrichten über Hersteller {manufacturer.name} gefunden."
-        
-        body_pt = f"**Fabricante para verificação:** {manufacturer.name}\n"
-        body_pt += f"**Sites do fabricante:** {websites_str}\n\n"
-        body_pt += f"No período de {start_date.strftime('%d.%m.%Y')} a {end_date.strftime('%d.%m.%Y')}, nenhuma notícia foi encontrada sobre o fabricante {manufacturer.name}."
+        body_ru = f"За период с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')} новостей о производителе {manufacturer.name} не обнаружено."
+        body_en = f"For the period from {start_date.strftime('%d.%m.%Y')} to {end_date.strftime('%d.%m.%Y')}, no news was found about manufacturer {manufacturer.name}."
+        body_de = f"Für den Zeitraum vom {start_date.strftime('%d.%m.%Y')} bis {end_date.strftime('%d.%m.%Y')} wurden keine Nachrichten über Hersteller {manufacturer.name} gefunden."
+        body_pt = f"No período de {start_date.strftime('%d.%m.%Y')} a {end_date.strftime('%d.%m.%Y')}, nenhuma notícia foi encontrada sobre o fabricante {manufacturer.name}."
         
         news_post = NewsPost.objects.create(
             title=title_ru,
@@ -1270,33 +1734,12 @@ CRITICALLY IMPORTANT:
         title_de = f"Fehler bei der Suche nach Nachrichten über Hersteller '{manufacturer.name}'"
         title_pt = f"Erro ao buscar notícias sobre o fabricante '{manufacturer.name}'"
         
-        # Собираем сайты производителя
-        websites = []
-        if manufacturer.website_1:
-            websites.append(manufacturer.website_1)
-        if manufacturer.website_2:
-            websites.append(manufacturer.website_2)
-        if manufacturer.website_3:
-            websites.append(manufacturer.website_3)
-        
-        websites_str = ", ".join([f"[{url}]({url})" for url in websites]) if websites else "нет указанных сайтов"
         source_url = manufacturer.website_1 or ''
         
-        body_ru = f"**Производитель для проверки:** {manufacturer.name}\n"
-        body_ru += f"**Сайты производителя:** {websites_str}\n\n"
-        body_ru += f"При попытке получить новости о производителе {manufacturer.name} произошла ошибка:\n\n{error_message}"
-        
-        body_en = f"**Manufacturer for verification:** {manufacturer.name}\n"
-        body_en += f"**Manufacturer websites:** {websites_str}\n\n"
-        body_en += f"An error occurred while trying to get news about manufacturer {manufacturer.name}:\n\n{error_message}"
-        
-        body_de = f"**Hersteller zur Überprüfung:** {manufacturer.name}\n"
-        body_de += f"**Hersteller-Websites:** {websites_str}\n\n"
-        body_de += f"Beim Versuch, Nachrichten über Hersteller {manufacturer.name} zu erhalten, ist ein Fehler aufgetreten:\n\n{error_message}"
-        
-        body_pt = f"**Fabricante para verificação:** {manufacturer.name}\n"
-        body_pt += f"**Sites do fabricante:** {websites_str}\n\n"
-        body_pt += f"Ocorreu um erro ao tentar obter notícias sobre o fabricante {manufacturer.name}:\n\n{error_message}"
+        body_ru = f"При попытке получить новости о производителе {manufacturer.name} произошла ошибка:\n\n{error_message}"
+        body_en = f"An error occurred while trying to get news about manufacturer {manufacturer.name}:\n\n{error_message}"
+        body_de = f"Beim Versuch, Nachrichten über Hersteller {manufacturer.name} zu erhalten, ist ein Fehler aufgetreten:\n\n{error_message}"
+        body_pt = f"Ocorreu um erro ao tentar obter notícias sobre o fabricante {manufacturer.name}:\n\n{error_message}"
         
         news_post = NewsPost.objects.create(
             title=title_ru,
@@ -1459,7 +1902,9 @@ CRITICALLY IMPORTANT:
                     status_obj.save()
                 
                 try:
-                    created, errors, error_msg = self.discover_news_for_manufacturer(manufacturer)
+                    # Используем провайдер из status_obj, если указан, иначе 'auto'
+                    provider = status_obj.provider if status_obj else 'auto'
+                    created, errors, error_msg = self.discover_news_for_manufacturer(manufacturer, provider=provider)
                     total_created += created
                     total_errors += errors
                     

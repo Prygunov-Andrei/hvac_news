@@ -1,7 +1,10 @@
 from rest_framework import serializers
 from django.utils import timezone
 from django.conf import settings
-from .models import NewsPost, NewsMedia, Comment, MediaUpload
+from .models import (
+    NewsPost, NewsMedia, Comment, MediaUpload, 
+    SearchConfiguration, NewsDiscoveryRun, DiscoveryAPICall
+)
 from users.serializers import UserSerializer
 import os
 
@@ -266,4 +269,129 @@ class MediaUploadSerializer(serializers.ModelSerializer):
         """Автор устанавливается автоматически из request.user"""
         validated_data['uploaded_by'] = self.context['request'].user
         return super().create(validated_data)
+
+
+class SearchConfigurationSerializer(serializers.ModelSerializer):
+    """Сериализатор для конфигурации поиска"""
+    
+    class Meta:
+        model = SearchConfiguration
+        fields = (
+            'id', 'name', 'is_active',
+            'primary_provider', 'fallback_chain',
+            'temperature', 'timeout', 'max_news_per_resource', 'delay_between_requests',
+            'max_search_results', 'search_context_size',
+            'grok_model', 'anthropic_model', 'gemini_model', 'openai_model',
+            'grok_input_price', 'grok_output_price',
+            'anthropic_input_price', 'anthropic_output_price',
+            'gemini_input_price', 'gemini_output_price',
+            'openai_input_price', 'openai_output_price',
+            'created_at', 'updated_at'
+        )
+        read_only_fields = ('id', 'created_at', 'updated_at')
+
+
+class SearchConfigurationListSerializer(serializers.ModelSerializer):
+    """Краткий сериализатор для списка конфигураций"""
+    
+    class Meta:
+        model = SearchConfiguration
+        fields = ('id', 'name', 'is_active', 'primary_provider', 'max_search_results', 
+                  'temperature', 'updated_at')
+        read_only_fields = fields
+
+
+class DiscoveryAPICallSerializer(serializers.ModelSerializer):
+    """Сериализатор для записей API вызовов"""
+    resource_name = serializers.SerializerMethodField()
+    manufacturer_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = DiscoveryAPICall
+        fields = (
+            'id', 'discovery_run', 'resource', 'resource_name', 
+            'manufacturer', 'manufacturer_name',
+            'provider', 'model', 'input_tokens', 'output_tokens',
+            'cost_usd', 'duration_ms', 'success', 'error_message',
+            'news_extracted', 'created_at'
+        )
+        read_only_fields = fields
+    
+    def get_resource_name(self, obj):
+        return obj.resource.name if obj.resource else None
+    
+    def get_manufacturer_name(self, obj):
+        return obj.manufacturer.name if obj.manufacturer else None
+
+
+class NewsDiscoveryRunSerializer(serializers.ModelSerializer):
+    """Сериализатор для запусков поиска"""
+    duration_display = serializers.SerializerMethodField()
+    efficiency = serializers.SerializerMethodField()
+    api_calls_count = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = NewsDiscoveryRun
+        fields = (
+            'id', 'last_search_date', 'config_snapshot',
+            'started_at', 'finished_at', 'duration_display',
+            'total_requests', 'total_input_tokens', 'total_output_tokens',
+            'estimated_cost_usd',
+            'provider_stats',
+            'news_found', 'news_duplicates', 'resources_processed', 'resources_failed',
+            'efficiency', 'api_calls_count',
+            'created_at', 'updated_at'
+        )
+        read_only_fields = fields
+    
+    def get_duration_display(self, obj):
+        return obj.get_duration_display()
+    
+    def get_efficiency(self, obj):
+        return obj.get_efficiency()
+    
+    def get_api_calls_count(self, obj):
+        return obj.api_calls.count()
+
+
+class NewsDiscoveryRunListSerializer(serializers.ModelSerializer):
+    """Краткий сериализатор для списка запусков"""
+    duration_display = serializers.SerializerMethodField()
+    efficiency = serializers.SerializerMethodField()
+    config_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = NewsDiscoveryRun
+        fields = (
+            'id', 'last_search_date', 'config_name',
+            'started_at', 'finished_at', 'duration_display',
+            'total_requests', 'estimated_cost_usd',
+            'news_found', 'resources_processed', 'resources_failed',
+            'efficiency', 'created_at'
+        )
+        read_only_fields = fields
+    
+    def get_duration_display(self, obj):
+        return obj.get_duration_display()
+    
+    def get_efficiency(self, obj):
+        return obj.get_efficiency()
+    
+    def get_config_name(self, obj):
+        if obj.config_snapshot:
+            return obj.config_snapshot.get('name', 'Unknown')
+        return None
+
+
+class DiscoveryStatsSerializer(serializers.Serializer):
+    """Сериализатор для агрегированной статистики"""
+    total_runs = serializers.IntegerField()
+    total_news_found = serializers.IntegerField()
+    total_cost_usd = serializers.DecimalField(max_digits=10, decimal_places=4)
+    total_requests = serializers.IntegerField()
+    total_input_tokens = serializers.IntegerField()
+    total_output_tokens = serializers.IntegerField()
+    avg_efficiency = serializers.FloatField()
+    avg_cost_per_run = serializers.DecimalField(max_digits=10, decimal_places=4)
+    provider_breakdown = serializers.DictField()
 
