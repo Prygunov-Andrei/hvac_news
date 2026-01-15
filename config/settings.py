@@ -269,13 +269,13 @@ TRANSLATION_MODEL = os.getenv('TRANSLATION_MODEL', 'gpt-4o-mini')  # OpenAI mode
 TRANSLATION_ENABLED = os.getenv('TRANSLATION_ENABLED', 'True') == 'True'
 
 # News Discovery Configuration
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyC0jX3-k6XUwFQ8DrdY3EwzKfaf22uLiFk')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')  # Google Gemini API key
 NEWS_DISCOVERY_OPENAI_MODEL = os.getenv('NEWS_DISCOVERY_OPENAI_MODEL', 'gpt-5.2')  # GPT-5.2 Thinking для Chat Completions API (gpt-5.2-pro только в Responses API)
 NEWS_DISCOVERY_GEMINI_MODEL = os.getenv('NEWS_DISCOVERY_GEMINI_MODEL', 'gemini-3-pro-preview')  # Gemini 3 Pro с поддержкой веб-поиска
 NEWS_DISCOVERY_TIMEOUT = int(os.getenv('NEWS_DISCOVERY_TIMEOUT', '120'))  # Таймаут в секундах
 
 # Grok (xAI) Configuration
-XAI_API_KEY = os.getenv('XAI_API_KEY', 'YOUR_XAI_API_KEY')
+XAI_API_KEY = os.getenv('XAI_API_KEY', '')  # xAI (Grok) API key
 NEWS_DISCOVERY_GROK_MODEL = os.getenv('NEWS_DISCOVERY_GROK_MODEL', 'grok-4-1-fast')  # Grok 4.1 Fast с веб-поиском
 NEWS_DISCOVERY_USE_GROK = os.getenv('NEWS_DISCOVERY_USE_GROK', 'True') == 'True'  # Использовать Grok вместо OpenAI
 NEWS_DISCOVERY_USE_OPENAI_FALLBACK = os.getenv('NEWS_DISCOVERY_USE_OPENAI_FALLBACK', 'True') == 'True'  # Использовать OpenAI как резервный вариант

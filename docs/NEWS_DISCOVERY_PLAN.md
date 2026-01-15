@@ -219,7 +219,7 @@
 Добавить настройки:
 ```python
 # News Discovery Configuration
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'YOUR_GEMINI_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')  # Установите в .env файле
 NEWS_DISCOVERY_OPENAI_MODEL = os.getenv('NEWS_DISCOVERY_OPENAI_MODEL', 'gpt-4o')
 NEWS_DISCOVERY_GEMINI_MODEL = os.getenv('NEWS_DISCOVERY_GEMINI_MODEL', 'gemini-2.5-flash')  # Доступна на бесплатном тарифе
 NEWS_DISCOVERY_TIMEOUT = int(os.getenv('NEWS_DISCOVERY_TIMEOUT', '120'))  # Таймаут в секундах
